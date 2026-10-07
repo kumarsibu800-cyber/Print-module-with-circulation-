@@ -17740,6 +17740,13 @@ function mergeTombs(a, b) {
     }
     return [...out.values()];
 }
+function pickAdmin(mine, theirs, theirsNewer) {
+    if (!mine) return theirs || null;
+    if (!theirs) return mine;
+    // Two separately created admin logins: keep the one created first, so its password keeps working everywhere.
+    if (mine.born && theirs.born && mine.born !== theirs.born) return mine.born < theirs.born ? mine : theirs;
+    return theirsNewer ? theirs : mine;
+}
 function mergeStates(local, remote, catalogue) {
     if (!remote || remote.v !== 1)
         return { state: local, catalogue, changed: true };
@@ -17763,7 +17770,7 @@ function mergeStates(local, remote, catalogue) {
         stockHistory: theirStockNewer ? remote.stockHistory || [] : local.stockHistory || [],
         missing: theirStockNewer ? remote.missing || {} : local.missing || {},
         stockU: Math.max(local.stockU || 0, remote.stockU || 0),
-        admin: theirAdminNewer ? remote.admin : local.admin || remote.admin || null,
+        admin: pickAdmin(local.admin, remote.admin, theirAdminNewer),
         adminU: Math.max(local.adminU || 0, remote.adminU || 0),
         notifiedU: Math.max(local.notifiedU || 0, remote.notifiedU || 0),
         settings: theirSettingsNewer ? { ...local.settings, ...remote.settings } : local.settings,
@@ -20632,6 +20639,22 @@ function newOtp() {
     const r = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
     return String(r).padStart(6, "0");
 }
+const flipFirst = (t) => (t ? (t[0] === t[0].toUpperCase() ? t[0].toLowerCase() : t[0].toUpperCase()) + t.slice(1) : t);
+const flipAll = (t) => Array.from(t, (c) => (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase())).join("");
+async function passwordMatches(pw, admin) {
+    // The exact password first; then the small changes phone keyboards and Caps Lock make by themselves:
+    // a space added after the last word, a capital first letter, or every letter's case swapped.
+    const t = pw.trim();
+    const tries = [pw, t, t + " ", flipFirst(t), flipFirst(t) + " ", flipAll(t)];
+    const seen = new Set();
+    for (const v of tries) {
+        if (!v || seen.has(v)) continue;
+        seen.add(v);
+        if ((await pbkdf2(v, admin.salt)) === admin.hash) return true;
+    }
+    return false;
+}
+const pwSpaceError = (pw) => (pw !== pw.trim() ? "The password can't start or end with a space." : "");
 const maskEmail = (e) => {
     const [u, d] = String(e || "").split("@");
     if (!d)
@@ -20740,7 +20763,7 @@ function PasswordField({ label, value, onChange, onEnter, auto }) {
     return (React.createElement("label", { className: "field" },
         React.createElement("span", null, label),
         React.createElement("div", { style: { display: "flex", gap: 8 } },
-            React.createElement("input", { className: "input", type: show ? "text" : "password", value: value, autoComplete: auto || "current-password", onChange: (e) => onChange(e.target.value), onKeyDown: (e) => e.key === "Enter" && onEnter && onEnter() }),
+            React.createElement("input", { className: "input", type: show ? "text" : "password", autoCapitalize: "none", autoCorrect: "off", spellCheck: false, value: value, autoComplete: auto || "current-password", onChange: (e) => onChange(e.target.value), onKeyDown: (e) => e.key === "Enter" && onEnter && onEnter() }),
             React.createElement("button", { type: "button", className: "btn btn-ghost", style: { flexShrink: 0 }, onClick: () => setShow(!show) }, show ? "Hide" : "Show"))));
 }
 function RecoveryCodeCard({ code, onDone, doneLabel }) {
@@ -20778,6 +20801,8 @@ function AdminSetup({ ctx, onCreated }) {
             return setErr("Choose an admin ID with no spaces, such as admin.");
         if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim()))
             return setErr("Enter the email address where OTP codes should go.");
+        if (pwSpaceError(pw))
+            return setErr(pwSpaceError(pw));
         if (pw.length < 8)
             return setErr("Use a password of at least 8 characters.");
         if (pw !== pw2)
@@ -20797,6 +20822,7 @@ function AdminSetup({ ctx, onCreated }) {
                 lockAfter: 30,
                 mail: { service: "", template: "", key: "" },
                 created: todayISO(),
+                born: Date.now(),
             };
             setMade(admin);
             setCode(rc);
@@ -20845,7 +20871,13 @@ function AdminLogin({ ctx, admin, onSignedIn, onForgot }) {
         setBusy(true);
         let ok = false;
         try {
-            ok = sameId(id, admin.id) && (await pbkdf2(pw, admin.salt)) === admin.hash;
+            if (!sameId(id, admin.id)) {
+                setBusy(false);
+                setFails(fails + 1);
+                setErr(`That isn't the admin ID. It starts with \u201c${String(admin.id).slice(0, 2)}\u2026\u201d.`);
+                return;
+            }
+            ok = await passwordMatches(pw, admin);
         }
         catch (e) {
             setErr("This device couldn't check the password. Open the app from its https address.");
@@ -20865,7 +20897,7 @@ function AdminLogin({ ctx, admin, onSignedIn, onForgot }) {
             setErr("Too many wrong tries. Wait 30 seconds, or use Forgot password.");
         }
         else
-            setErr("The admin ID or password is wrong.");
+            setErr("The admin ID is right, but the password is wrong. Check Caps Lock, or use Forgot password.");
     };
     return (React.createElement(GateShell, { library: ctx.s.library, title: "Admin login", sub: "Sign in to open Library Circulation." },
         React.createElement("label", { className: "field" },
@@ -20985,6 +21017,8 @@ function AdminForgot({ ctx, admin, onBack, onReset }) {
         setErr("");
         if (!proof)
             return;
+        if (pwSpaceError(pw))
+            return setErr(pwSpaceError(pw));
         if (pw.length < 8)
             return setErr("Use a password of at least 8 characters.");
         if (pw !== pw2)
@@ -21083,14 +21117,16 @@ function AdminPanel({ ctx }) {
         setPw("");
         setPw2("");
     };
-    const checkCurrent = async () => (await pbkdf2(cur, admin.salt)) === admin.hash;
+    const checkCurrent = async () => passwordMatches(cur, admin);
     const savePassword = async () => {
         setErr("");
         setBusy(true);
         try {
             if (!(await checkCurrent()))
                 return setErr("The current password is wrong.");
-            if (pw.length < 8)
+            if (pwSpaceError(pw))
+            return setErr(pwSpaceError(pw));
+        if (pw.length < 8)
                 return setErr("Use a password of at least 8 characters.");
             if (pw !== pw2)
                 return setErr("The two new passwords don't match.");
