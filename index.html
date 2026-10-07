@@ -17466,13 +17466,13 @@ function loansCsv(state, today) {
         return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
     };
     const head = ["Accession no.", "Title", "Author", "Call no.", "Borrower ID", "Borrower", "Type", "Class or department",
-        "Issued", "Due", "Returned", "Days late", "Fine", "Fine paid", "Renewals"];
+        "Issued", "Due", "Returned", "Days late", "Fine", "Fine paid", "Renewals", "Condition on return", "Damage noted"];
     const rows = [...state.loans].sort((a, b) => (a.issued < b.issued ? -1 : 1)).map((l) => {
         const b = BOOK_BY_SL.get(l.sl);
         const m = members.get(l.memberId);
         const fine = loanFine(l, today, s);
         return [b.code, b.title, b.author, b.call, l.memberId, m ? m.name : "Removed borrower", m ? m.type : "", m ? m.group : "",
-            l.issued, l.due, l.returned || "", lateDays(l, today), fine, l.returned ? (fine ? (l.finePaid ? "Yes" : "No") : "") : "Not yet returned", l.renewals || 0];
+            l.issued, l.due, l.returned || "", lateDays(l, today), fine, l.returned ? (fine ? (l.finePaid ? "Yes" : "No") : "") : "Not yet returned", l.renewals || 0, condLabel(l.condition), l.conditionNote || ""];
     });
     return "\uFEFF" + [head, ...rows].map((r) => r.map(esc).join(",")).join("\r\n");
 }
@@ -18479,6 +18479,8 @@ body.printing{background:#fff !important}
 .gate-sub{text-align:center;color:var(--muted);font-size:14px;margin:0 0 10px}
 .gate-code{font-family:'Courier New',Courier,monospace;font-size:24px;font-weight:700;letter-spacing:.08em;text-align:center;background:#fff;border:1.5px dashed var(--brass);border-radius:10px;padding:10px;margin:10px 0}
 .gate-otp{font-family:'Courier New',Courier,monospace;font-size:22px;letter-spacing:.2em;text-align:center}
+.cond-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
+.cond-btn{min-height:48px;border-radius:10px;border:2px solid transparent;font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:center;gap:6px;padding:6px 8px;text-align:center}
 .save-bar{background:var(--stamp);color:#fff;font-size:13px;text-align:center;padding:6px 12px}
 `;
 /* ---------- printing ---------- */
@@ -18526,7 +18528,7 @@ function PrintButton({ onClick, label, block }) {
 
 const loanStatus = (l, today) => {
     if (l.returned)
-        return l.closedAs ? `Closed as ${l.closedAs}` : `Returned ${fmtDate(l.returned)}`;
+        return l.closedAs ? `Closed as ${l.closedAs}` : `Returned ${fmtDate(l.returned)}${l.condition ? `, ${condLabel(l.condition).toLowerCase()}` : ""}`;
     const late = lateDays(l, today);
     return late > 0 ? `${plural(late, "day")} late` : `Due ${fmtDate(l.due)}`;
 };
@@ -18637,13 +18639,14 @@ const PRINT = {
 <p class="pr-small">A fine of ${hx(money(s.finePerDay, s))} a day applies after the due date.</p></div>`;
         printHtml("Date due slip", body, s, "slip");
     },
-    receipt(book, member, fine, paid, ctx) {
+    receipt(book, member, fine, paid, ctx, condition, conditionNote) {
         const s = ctx.s;
         const body = `<div class="pr-slipcard">
 <div class="pr-sliplib">${hx(s.library || "Library")}</div>
 <div class="pr-sliphead"><span>RETURN RECEIPT</span><span>Acc. ${hx(book.code)}</span></div>
 <p><b>${hx(book.title)}</b><br>${hx(book.author)}</p>
 <p>Returned by ${hx(member ? `${member.name} (${member.id})` : "a removed borrower")}<br>on ${hx(fmtDate(ctx.today))}</p>
+${condition ? `<p>Condition on return: <b>${hx(condLabel(condition))}</b>${conditionNote ? `<br>${hx(conditionNote)}` : ""}</p>` : ""}
 <p>${fine ? `Fine: ${hx(money(fine, s))}, ${paid ? "paid" : "still owed"}` : "No fine. Thank you!"}</p></div>`;
         printHtml("Return receipt", body, s, "slip");
     },
@@ -18764,6 +18767,35 @@ function BookRow({ book, loan, today, onClick, disabled, pressed, end, missing }
                 book.code)),
         React.createElement("div", { className: "row-end" }, end || React.createElement(BookStatus, { loan: loan, today: today, missing: missing }))));
 }
+const CONDITIONS = [
+    ["good", "Good condition", "#2E8B57", "#E0F0E7"],
+    ["slight", "Slightly damaged", "#9A6B00", "#FAF0D8"],
+    ["partial", "Partially damaged", "#C2401C", "#FBE8E1"],
+    ["full", "Fully damaged", "#A3214B", "#F7E3EA"],
+];
+const condInfo = (k) => CONDITIONS.find((c) => c[0] === k);
+const condLabel = (k) => (condInfo(k) ? condInfo(k)[1] : "");
+function lastCondition(loans, sl) {
+    let best = null;
+    for (const l of loans) {
+        if (l.sl === sl && l.returned && l.condition && (!best || l.returned > best.returned || (l.returned === best.returned && (l.u || 0) > (best.u || 0)))) best = l;
+    }
+    return best ? { key: best.condition, date: best.returned, note: best.conditionNote || "" } : null;
+}
+function CondPill({ k }) {
+    const c = condInfo(k);
+    if (!c) return null;
+    return React.createElement("span", { className: "pill", style: { background: c[3], color: c[2] } }, c[1]);
+}
+function ConditionPicker({ value, onChange }) {
+    return React.createElement("div", { className: "cond-grid", role: "radiogroup", "aria-label": "Condition of the book" },
+        CONDITIONS.map(([k, label, fg, bg]) => React.createElement("button", {
+            key: k, type: "button", role: "radio", "aria-checked": value === k,
+            className: "cond-btn" + (value === k ? " on" : ""),
+            style: value === k ? { background: fg, borderColor: fg, color: "#fff" } : { background: bg, borderColor: bg, color: fg },
+            onClick: () => onChange(k),
+        }, value === k ? React.createElement(Check, { size: 16 }) : null, label)));
+}
 function LoanRow({ loan, ctx, onClick, showMember = true }) {
     const book = BOOK_BY_SL.get(loan.sl);
     const member = ctx.d.memberById.get(loan.memberId);
@@ -18775,6 +18807,7 @@ function LoanRow({ loan, ctx, onClick, showMember = true }) {
             React.createElement("div", { className: "row-sub" }, showMember ? (member ? `${member.name}, ${member.id}` : "Removed member") : `Issued ${fmtDate(loan.issued)}`)),
         React.createElement("div", { className: "row-end" },
             React.createElement(DuePill, { loan: loan, today: ctx.today }),
+            loan.returned && loan.condition && loan.condition !== "good" && React.createElement(CondPill, { k: loan.condition }),
             fine > 0 && (React.createElement("span", { className: "row-sub", style: { color: loan.finePaid ? "var(--muted)" : "var(--stamp)" } }, loan.returned ? (loan.finePaid ? `Fine ${money(fine, ctx.s)} paid` : `Owes ${money(fine, ctx.s)}`) : `Fine ${money(fine, ctx.s)} so far`)))));
 }
 /* ---------- views ---------- */
@@ -19877,6 +19910,13 @@ function IssueFlow({ ctx, presetSl, presetMemberId }) {
                         " Acc. ",
                         book.code)),
                 React.createElement("button", { className: "btn btn-ghost", onClick: () => setSl(null) }, "Change")),
+            !bookLoan && (() => {
+                const lc = lastCondition(state.loans, book.sl);
+                if (!lc || lc.key === "good") return null;
+                return React.createElement("div", { className: lc.key === "full" ? "notice warn" : "notice caution" },
+                    `Last returned ${condLabel(lc.key).toLowerCase()} on ${fmtDate(lc.date)}${lc.note ? ` (${lc.note})` : ""}.`,
+                    lc.key === "full" ? " Check it can still be lent before issuing it." : "");
+            })(),
             bookLoan && (React.createElement("div", { className: "notice warn" },
                 "This book is already on loan to ",
                 ((_a = d.memberById.get(bookLoan.memberId)) === null || _a === void 0 ? void 0 : _a.name) || "a removed borrower",
@@ -19913,12 +19953,16 @@ function ReturnFlow({ ctx, presetLoanId }) {
     const [q, setQ] = useState("");
     const [retDate, setRetDate] = useState(today);
     const [paid, setPaid] = useState(true);
+    const [cond, setCond] = useState(null);
+    const [condNote, setCondNote] = useState("");
     const [result, setResult] = useState(null);
     const reset = () => {
         setLoanId(null);
         setQ("");
         setRetDate(today);
         setPaid(true);
+        setCond(null);
+        setCondNote("");
         setResult(null);
     };
     if (result) {
@@ -19926,7 +19970,7 @@ function ReturnFlow({ ctx, presetLoanId }) {
         const m = d.memberById.get(result.memberId);
         const buttons = (React.createElement("div", { className: "btn-row" },
             m && m.phone && result.kind === "in" && (React.createElement("button", { className: "btn btn-blue", onClick: () => open("message", { memberId: m.id, kind: "returned", loanIds: [result.loanId] }) }, "Send receipt")),
-            result.kind === "in" && React.createElement(PrintButton, { label: "Print receipt", onClick: () => PRINT.receipt(b, m, result.fine, result.paid, ctx) }),
+            result.kind === "in" && React.createElement(PrintButton, { label: "Print receipt", onClick: () => PRINT.receipt(b, m, result.fine, result.paid, ctx, result.condition, result.conditionNote) }),
             React.createElement("button", { className: "btn btn-ghost", onClick: reset }, "Return another"),
             React.createElement("button", { className: "btn btn-primary", onClick: close }, "Done")));
         if (result.kind === "renew") {
@@ -19952,7 +19996,15 @@ function ReturnFlow({ ctx, presetLoanId }) {
                         b.shelf)),
                 React.createElement("div", null,
                     React.createElement("dt", null, "Fine"),
-                    React.createElement("dd", { style: { color: result.fine && !result.paid ? "var(--stamp)" : undefined } }, result.fine ? `${money(result.fine, s)} ${result.paid ? "collected" : "unpaid"}` : "None"))),
+                    React.createElement("dd", { style: { color: result.fine && !result.paid ? "var(--stamp)" : undefined } }, result.fine ? `${money(result.fine, s)} ${result.paid ? "collected" : "unpaid"}` : "None")),
+                result.condition && React.createElement("div", { style: result.conditionNote ? undefined : { gridColumn: "1 / -1" } },
+                    React.createElement("dt", null, "Condition"),
+                    React.createElement("dd", { style: { color: condInfo(result.condition)[2] } }, condLabel(result.condition))),
+                result.conditionNote && React.createElement("div", null,
+                    React.createElement("dt", null, "Damage noted"),
+                    React.createElement("dd", null, result.conditionNote))),
+            result.condition === "full" && React.createElement("div", { className: "notice warn" },
+                "This book came back fully damaged. Keep it off the shelf; the app warns anyone who tries to issue it. If it can't be used again, open the book and choose Record as lost."),
             buttons));
     }
     const loan = loanId ? state.loans.find((l) => l.id === loanId && !l.returned) : null;
@@ -19991,6 +20043,14 @@ function ReturnFlow({ ctx, presetLoanId }) {
                     "Pick a date between ",
                     fmtDate(loan.issued),
                     " and today.")),
+            React.createElement("div", { className: "field" },
+                React.createElement("span", null, "Condition of the book"),
+                React.createElement(ConditionPicker, { value: cond, onChange: setCond }),
+                cond && cond !== "good" && React.createElement("input", {
+                    className: "input", style: { marginTop: 8 }, value: condNote, maxLength: 120,
+                    placeholder: "What is damaged? (optional) e.g. cover torn, pages missing",
+                    onChange: (e) => setCondNote(e.target.value),
+                })),
             fine > 0 ? (React.createElement("div", { className: "notice warn" },
                 "Returned ",
                 plural(late, "day"),
@@ -20002,10 +20062,11 @@ function ReturnFlow({ ctx, presetLoanId }) {
                 React.createElement("label", { className: "check" },
                     React.createElement("input", { type: "checkbox", checked: paid, onChange: (e) => setPaid(e.target.checked) }),
                     "Fine collected now"))) : (!badDate && React.createElement("div", { className: "notice" }, "On time. No fine.")),
-            React.createElement("button", { className: "btn btn-primary btn-big btn-block", style: { marginTop: 16 }, disabled: badDate, onClick: () => {
-                    actions.checkIn(loan.id, retDate, paid);
-                    setResult({ kind: "in", loanId: loan.id, sl: loan.sl, memberId: loan.memberId, fine, paid: fine > 0 && paid });
+            React.createElement("button", { className: "btn btn-primary btn-big btn-block", style: { marginTop: 16 }, disabled: badDate || !cond, onClick: () => {
+                    actions.checkIn(loan.id, retDate, paid, cond, condNote.trim());
+                    setResult({ kind: "in", loanId: loan.id, sl: loan.sl, memberId: loan.memberId, fine, paid: fine > 0 && paid, condition: cond, conditionNote: condNote.trim() });
                 } }, "Check in"),
+            !cond && !badDate && React.createElement("p", { style: { fontSize: 13, color: "var(--muted)", textAlign: "center", margin: "8px 0 0" } }, "Choose the book's condition to check it in."),
             React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 10 }, disabled: lateToday || renewsLeft <= 0, onClick: () => {
                     const nd = actions.renew(loan.id);
                     setResult({ kind: "renew", sl: loan.sl, memberId: loan.memberId, due: nd });
@@ -20053,6 +20114,7 @@ function BookDetail({ ctx, sl }) {
     const loan = d.activeByBook.get(sl);
     const cat = CATS[b.cat];
     const history = state.loans.filter((l) => l.sl === sl).sort((a, c) => (a.issued < c.issued ? 1 : -1));
+    const lastCond = lastCondition(state.loans, sl);
     const twin = CODE_COUNT.get(b.code) > 1 ? BOOKS.find((x) => x.code === b.code && x.sl !== sl) : null;
     return (React.createElement("div", null,
         React.createElement("div", { className: "head-flex cat-head", style: catStyle(b.cat) },
@@ -20079,7 +20141,12 @@ function BookDetail({ ctx, sl }) {
                 React.createElement("dd", null,
                     b.shelfNo,
                     ", shelf ",
-                    b.shelf))),
+                    b.shelf)),
+            React.createElement("div", { style: { gridColumn: "1 / -1" } },
+                React.createElement("dt", null, "Condition"),
+                React.createElement("dd", null, lastCond
+                    ? React.createElement(React.Fragment, null, React.createElement(CondPill, { k: lastCond.key }), ` on return, ${fmtDate(lastCond.date)}`, lastCond.note ? `: ${lastCond.note}` : "")
+                    : "Not recorded yet"))),
         twin && (React.createElement("div", { className: "notice caution" },
             "Accession no. ",
             b.code,
@@ -21606,13 +21673,13 @@ function App() {
             });
             return loan;
         },
-        checkIn: (id, returned, paidNow) => setState((p) => ({
+        checkIn: (id, returned, paidNow, condition, conditionNote) => setState((p) => ({
             ...p,
             loans: p.loans.map((l) => {
                 if (l.id !== id)
                     return l;
                 const fine = Math.max(0, diffDays(l.due, returned)) * p.settings.finePerDay;
-                return stamp({ ...l, returned, fine, finePaid: fine === 0 || !!paidNow });
+                return stamp({ ...l, returned, fine, finePaid: fine === 0 || !!paidNow, condition: condition || l.condition, conditionNote: conditionNote || "" });
             }),
         })),
         renew: (id) => {

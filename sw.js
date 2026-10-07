@@ -1,7 +1,7 @@
 // Library Circulation offline helper.
 // The app page itself always comes fresh from the internet when there is a connection,
 // and from the saved copy only when offline, so a new upload shows up on the next open.
-const CACHE = "library-circulation-v20";
+const CACHE = "library-circulation-v21";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png"];
 
 self.addEventListener("install", (e) => {
