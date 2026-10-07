@@ -19172,7 +19172,7 @@ function BookForm({ ctx, sl }) {
             React.createElement("button", { className: "btn btn-primary", onClick: save }, existing ? "Save changes" : "Add book")),
         existing && (React.createElement(React.Fragment, null,
             React.createElement("div", { className: "btn-row", style: { marginTop: 22 } },
-                React.createElement("button", { className: "btn btn-danger", disabled: !!onLoan || hasHistory, onClick: () => {
+                React.createElement("button", { className: "btn btn-danger", disabled: !!onLoan || hasHistory, onClick: async () => {
                         if (!confirmDelete)
                             return setConfirmDelete(true);
                         actions.deleteBook(existing.sl);
@@ -20288,7 +20288,7 @@ function MemberDetail({ ctx, memberId }) {
                 React.createElement(Pencil, { size: 16 }),
                 " Edit details"),
             React.createElement(PrintButton, { onClick: () => PRINT.borrower(m, ctx) }),
-            React.createElement("button", { className: "btn btn-danger", disabled: !canRemove, onClick: () => {
+            React.createElement("button", { className: "btn btn-danger", disabled: !canRemove, onClick: async () => {
                     if (!confirmRemove)
                         return setConfirmRemove(true);
                     actions.removeMember(m.id);
@@ -20610,12 +20610,12 @@ function SettingsForm({ ctx }) {
                         : ""),
             React.createElement("div", { className: "btn-row" },
                 React.createElement("button", { className: "btn btn-ghost", onClick: () => setPendingCat(null) }, "Cancel"),
-                pendingCat.merged && (React.createElement("button", { className: "btn btn-ghost", onClick: () => {
+                pendingCat.merged && (React.createElement("button", { className: "btn btn-ghost", onClick: async () => {
                         actions.replaceCatalogue(pendingCat);
                         setPendingCat(null);
                         close();
                     } }, "Replace catalogue")),
-                React.createElement("button", { className: "btn btn-primary", onClick: () => {
+                React.createElement("button", { className: "btn btn-primary", onClick: async () => {
                         actions.replaceCatalogue(pendingCat.merged || pendingCat);
                         setPendingCat(null);
                         close();
@@ -20658,7 +20658,7 @@ function SettingsForm({ ctx }) {
             " Restoring replaces everything currently on this iPad.",
             React.createElement("div", { className: "btn-row" },
                 React.createElement("button", { className: "btn btn-ghost", onClick: () => setPending(null) }, "Cancel"),
-                React.createElement("button", { className: "btn btn-primary", onClick: () => {
+                React.createElement("button", { className: "btn btn-primary", onClick: async () => {
                         actions.restore(pending.state, pending.catalogue);
                         setPending(null);
                         close();
@@ -20666,9 +20666,11 @@ function SettingsForm({ ctx }) {
             React.createElement(Upload, { size: 18 }),
             " Restore a backup")),
         React.createElement("h2", { className: "sec" }, "Erase"),
-        React.createElement("button", { className: "btn btn-danger btn-block", onClick: () => {
+        React.createElement("button", { className: "btn btn-danger btn-block", onClick: async () => {
                 if (!confirmReset)
                     return setConfirmReset(true);
+                if (!(await ctx.requirePassword("erase all borrowers and loans")))
+                    return setConfirmReset(false);
                 actions.resetAll();
                 close();
             } },
@@ -20829,6 +20831,30 @@ function GateShell({ title, sub, children, library }) {
             React.createElement("h1", { className: "gate-title" }, title),
             sub && React.createElement("p", { className: "gate-sub" }, sub),
             children)));
+}
+function PasswordAsk({ ask, admin, onDone }) {
+    const [pw, setPw] = useState("");
+    const [err, setErr] = useState("");
+    const [busy, setBusy] = useState(false);
+    const go = async () => {
+        if (!pw || busy) return;
+        setBusy(true);
+        const ok = await passwordMatches(pw, admin).catch(() => false);
+        setBusy(false);
+        if (ok) onDone(true);
+        else { setErr("Wrong password. Nothing was changed."); setPw(""); }
+    };
+    return (React.createElement("div", { className: "cm-overlay", style: { zIndex: 70 }, onClick: () => onDone(false) },
+        React.createElement("div", { className: "cm-sheet", role: "dialog", "aria-modal": "true", onClick: (e) => e.stopPropagation() },
+            React.createElement("div", { className: "cm-sheet-head" }, React.createElement("h2", null, "Admin password needed")),
+            React.createElement("div", { className: "cm-sheet-body" },
+                React.createElement("div", { className: "notice warn", style: { marginTop: 0 } },
+                    "To ", ask.label, ", enter the admin password. This can't be undone."),
+                React.createElement(PasswordField, { label: "Admin password", value: pw, onChange: (v) => { setPw(v); setErr(""); }, onEnter: go }),
+                err && React.createElement("p", { className: "pw-ask-err", style: { color: "#A3214B", fontSize: 14, margin: "8px 0 0", fontWeight: 600 } }, err),
+                React.createElement("div", { className: "btn-row" },
+                    React.createElement("button", { className: "btn btn-ghost", onClick: () => onDone(false) }, "Cancel"),
+                    React.createElement("button", { className: "btn btn-danger", disabled: !pw || busy, onClick: go }, busy ? "Checking…" : "Confirm"))))));
 }
 function PasswordField({ label, value, onChange, onEnter, auto }) {
     const [show, setShow] = useState(false);
@@ -21448,6 +21474,7 @@ function App() {
     const [fileAdmin, setFileAdmin] = useState(() => loadAdminFileCopy());
     const [fileState, setFileState] = useState("checking");
     const adminRef = useRef(null);
+    const [pwAsk, setPwAsk] = useState(null);
     const [, setLockTick] = useState(0);
     const [syncState, setSyncState] = useState({ busy: false, at: null, error: null });
     const stateRef = useRef(null);
@@ -21878,6 +21905,7 @@ function App() {
     const adminUnlocked = !!adminRec && (adminSessionLive(adminRec) || (adminOk && !(adminRec.lockAfter > 0)));
     const ctx = {
         state, d, today, s, actions, open, close, sync, syncState, connected, saveAdmin, adminLock, adminRec, fileAdmin, fileState,
+        requirePassword: (label) => adminRec ? new Promise((resolve) => setPwAsk({ label, resolve })) : Promise.resolve(true),
         connectSync: async (cfg) => {
             const out = await runSync(cfg, "create");
             return out;
@@ -21989,7 +22017,8 @@ function App() {
             sheet.type === "stock" && React.createElement(StockFlow, { key: sheet.key, ctx: ctx }),
             sheet.type === "reminders" && React.createElement(RemindersFlow, { key: sheet.key, ctx: ctx, kind: sheet.kind }),
             sheet.type === "message" && (React.createElement(MessageFlow, { key: sheet.key, ctx: ctx, memberId: sheet.memberId, kind: sheet.kind, loanIds: sheet.loanIds })),
-            sheet.type === "settings" && React.createElement(SettingsForm, { key: sheet.key, ctx: ctx })))));
+            sheet.type === "settings" && React.createElement(SettingsForm, { key: sheet.key, ctx: ctx }))),
+        pwAsk && adminRec && React.createElement(PasswordAsk, { ask: pwAsk, admin: adminRec, onDone: (ok) => { const r = pwAsk.resolve; setPwAsk(null); r(ok); } })));
 }
 
 class RescueBoundary extends React.Component {
