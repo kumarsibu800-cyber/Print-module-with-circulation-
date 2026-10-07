@@ -17,6 +17,41 @@
 </head>
 <body>
 <div id="root"></div>
+<script>(function(){
+  var KEYS=["circulation-desk:sync","circulation-desk:gtoken"];
+  function show(msg){
+    var root=document.getElementById("root");
+    if(!root) return;
+    if(root.getAttribute("data-ok")==="1" && !msg) return;
+    if(document.getElementById("rescue")) { if(msg){var d=document.getElementById("rescue-msg"); if(d) d.textContent=msg;} return; }
+    root.innerHTML='<div id="rescue" style="font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:520px;margin:40px auto;padding:20px;background:#fff;border-radius:14px;border:1px solid #D2D9D4;color:#1E2320">'+
+      '<h1 style="font-size:20px;margin:0 0 8px">Library Circulation could not open</h1>'+
+      '<p style="margin:0 0 12px;color:#58655E;font-size:15px">Your borrowers, loans and books are still saved on this device. Try these in order.</p>'+
+      '<button id="r1" style="width:100%;min-height:46px;border-radius:10px;border:0;background:#1D4536;color:#fff;font-size:16px;font-weight:600;margin-bottom:10px">1. Reload the app</button>'+
+      '<button id="r2" style="width:100%;min-height:46px;border-radius:10px;border:1px solid #D2D9D4;background:#fff;font-size:16px;font-weight:600;margin-bottom:10px">2. Switch off online sync on this device, then reload</button>'+
+      '<button id="r3" style="width:100%;min-height:46px;border-radius:10px;border:1px solid #D2D9D4;background:#fff;font-size:16px;font-weight:600">3. Fetch a fresh copy of the app, then reload</button>'+
+      '<p style="margin:14px 0 4px;font-size:13px;color:#58655E">If none of these work, send Claude a screenshot of this message:</p>'+
+      '<pre id="rescue-msg" style="white-space:pre-wrap;font-size:12px;background:#F3F5F4;padding:8px;border-radius:8px;margin:0"></pre></div>';
+    document.getElementById("rescue-msg").textContent=msg||"The app did not start.";
+    document.getElementById("r1").onclick=function(){location.reload();};
+    document.getElementById("r2").onclick=function(){try{KEYS.forEach(function(k){localStorage.removeItem(k);});}catch(e){} location.reload();};
+    document.getElementById("r3").onclick=function(){
+      var done=function(){location.reload();};
+      try{
+        var jobs=[];
+        if(window.caches) jobs.push(caches.keys().then(function(ks){return Promise.all(ks.map(function(k){return caches.delete(k);}));}));
+        if(navigator.serviceWorker) jobs.push(navigator.serviceWorker.getRegistrations().then(function(rs){return Promise.all(rs.map(function(r){return r.unregister();}));}));
+        Promise.all(jobs).then(done,done);
+      }catch(e){done();}
+    };
+  }
+  window.__showRescue=show;
+  var first=null;
+  window.addEventListener("error",function(e){ if(!first) first=(e.message||"Error")+(e.filename?"\n"+e.filename.split("/").pop()+":"+e.lineno:""); setTimeout(function(){var r=document.getElementById("root"); if(r && r.getAttribute("data-ok")!=="1") show(first);},50);});
+  window.addEventListener("unhandledrejection",function(e){ if(!first) first="Unhandled: "+(e.reason&&e.reason.message||e.reason); });
+  setTimeout(function(){var r=document.getElementById("root"); if(r && r.getAttribute("data-ok")!=="1") show(first||"The app took too long to start.");},10000);
+})();
+</script>
 <noscript>Turn on JavaScript in Safari settings to use Library Circulation.</noscript>
 <script>
 var process={env:{NODE_ENV:"production"}};var __defs={},__cache={};function require(n){if(__cache[n])return __cache[n].exports;var m={exports:{}};__cache[n]=m;__defs[n](m,m.exports);return m.exports;}
@@ -17191,6 +17226,11 @@ function applyCatalogue(cat) {
         hay: `${title} ${author} ${code} ${call}`.toLowerCase(),
     }));
     BOOK_BY_SL = new Map(BOOKS.map((b) => [b.sl, b]));
+    const realGet = BOOK_BY_SL.get.bind(BOOK_BY_SL);
+    BOOK_BY_SL.get = (sl) => realGet(sl) || (sl === undefined || sl === null ? undefined : {
+        sl, code: "?", title: "Book no longer in catalogue", author: "", cat: 0, call: "\u2014", shelfNo: "\u2014", shelf: 0,
+        hay: "", gone: true,
+    });
     CODE_COUNT = BOOKS.reduce((m, b) => m.set(b.code, (m.get(b.code) || 0) + 1), new Map());
     const shelfNos = [...new Set(BOOKS.map((b) => b.shelf))].sort((a, b) => a - b);
     SHELVES = shelfNos.map((n) => ({ n, total: BOOKS.filter((b) => b.shelf === n).length }));
@@ -20128,6 +20168,11 @@ function MemberDetail({ ctx, memberId }) {
         !canRemove && (React.createElement("p", { style: { fontSize: 13, color: "var(--muted)", margin: "8px 0 0" } }, "Borrowers with books out or unpaid fines can't be removed."))));
 }
 "use strict";
+const cleanClientId = (raw) => {
+    const t = String(raw || "").replace(/\s+/g, "");
+    const m = t.match(/[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com/i);
+    return m ? m[0] : "";
+};
 function SyncPanel({ ctx }) {
     const { sync, syncState, connectSync, disconnectSync, syncNow, googleSignIn } = ctx;
     const [provider, setProvider] = useState("gdrive");
@@ -20148,7 +20193,7 @@ function SyncPanel({ ctx }) {
         setBusy(true);
         try {
             if (provider === "gdrive")
-                await connectSync({ provider: "gdrive", clientId: clientId.trim() });
+                await connectSync({ provider: "gdrive", clientId: cleanClientId(clientId) });
             else
                 await connectSync({ provider: "jsonbin", key: key.trim(), bin: code.trim() });
             setKey("");
@@ -20208,9 +20253,12 @@ function SyncPanel({ ctx }) {
                 !httpsOk && (React.createElement("em", { style: { color: "var(--stamp)" } }, "Google sign-in only works from your https address. Open the app from GitHub Pages first."))),
             React.createElement("label", { className: "field" },
                 React.createElement("span", null, "Client ID"),
-                React.createElement("input", { className: "input", value: clientId, autoCapitalize: "none", autoCorrect: "off", placeholder: "\u2026apps.googleusercontent.com", onChange: (e) => setClientId(e.target.value) })),
+                React.createElement("input", { className: "input", value: clientId, autoCapitalize: "none", autoCorrect: "off", placeholder: "\u2026apps.googleusercontent.com", onChange: (e) => setClientId(e.target.value) }),
+                clientId.trim() && (cleanClientId(clientId)
+                    ? React.createElement("em", null, "Will use: ", React.createElement("b", { style: { fontFamily: "'Courier New',Courier,monospace", overflowWrap: "anywhere" } }, cleanClientId(clientId)), ". Check it matches the Client ID shown in Google Cloud, character for character.")
+                    : React.createElement("em", { style: { color: "var(--stamp)" } }, "This doesn't look like a Client ID. It should be numbers, a dash, letters and numbers, then .apps.googleusercontent.com. The client secret (starting GOCSPX-) won't work."))),
             syncState.error && React.createElement("div", { className: "notice warn" }, syncState.error),
-            React.createElement("button", { className: "btn btn-primary btn-block", style: { marginTop: 14 }, disabled: busy || !/\.apps\.googleusercontent\.com$/.test(clientId.trim()), onClick: connect }, busy ? "Waiting for Google…" : "Connect Google Drive"),
+            React.createElement("button", { className: "btn btn-primary btn-block", style: { marginTop: 14 }, disabled: busy || !cleanClientId(clientId), onClick: connect }, busy ? "Waiting for Google…" : "Connect Google Drive"),
             React.createElement("p", { style: { fontSize: 13, color: "var(--muted)", margin: "8px 0 0" } }, "Do the same on each device with the same Client ID and Google account. The second device finds the file the first one made, so there's no code to copy across."))) : (React.createElement(React.Fragment, null,
             React.createElement("p", { style: { fontSize: 14, color: "var(--muted)", margin: "0 0 10px" } }, "A free jsonbin.io account holds the online copy. Sign up, copy the master key from your account page, and paste it below on each of your devices."),
             React.createElement("label", { className: "field", style: { marginTop: 0 } },
@@ -20972,7 +21020,19 @@ function App() {
             sheet.type === "settings" && React.createElement(SettingsForm, { key: sheet.key, ctx: ctx })))));
 }
 
-ReactDOMClient.createRoot(document.getElementById("root")).render(React.createElement(App));
+class RescueBoundary extends React.Component {
+    constructor(props) { super(props); this.state = { err: null }; }
+    static getDerivedStateFromError(err) { return { err }; }
+    componentDidCatch(err, info) {
+        const where = info && info.componentStack ? info.componentStack.trim().split("\n").slice(0, 3).join("\n") : "";
+        const root = document.getElementById("root");
+        if (root) root.setAttribute("data-ok", "0");
+        setTimeout(() => window.__showRescue && window.__showRescue(String(err && err.message || err) + "\n" + where), 0);
+    }
+    componentDidMount() { const r = document.getElementById("root"); if (r) r.setAttribute("data-ok", "1"); }
+    render() { return this.state.err ? null : this.props.children; }
+}
+ReactDOMClient.createRoot(document.getElementById("root")).render(React.createElement(RescueBoundary, null, React.createElement(App)));
 })();
 if("serviceWorker" in navigator && /^https?:$/.test(location.protocol)){window.addEventListener("load",function(){navigator.serviceWorker.register("sw.js").catch(function(){});});}
 </script>

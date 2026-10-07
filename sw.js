@@ -1,5 +1,5 @@
 // Change the version below whenever you upload a new index.html, so iPads fetch the update.
-const CACHE = "library-circulation-v12";
+const CACHE = "library-circulation-v14";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png"];
 
 self.addEventListener("install", (e) => {
