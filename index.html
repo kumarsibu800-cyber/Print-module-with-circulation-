@@ -17710,6 +17710,8 @@ function toDoc(state, catalogue) {
         stockHistory: state.stockHistory || [],
         missing: state.missing || {},
         stockU: state.stockU || 0,
+        admin: state.admin || null,
+        adminU: state.adminU || 0,
         settings: state.settings,
         settingsU: state.settingsU || 0,
         seq: state.seq,
@@ -17749,6 +17751,7 @@ function mergeStates(local, remote, catalogue) {
     const theirCatNewer = (remote.catalogueU || 0) > ((catalogue.meta && catalogue.meta.u) || 0);
     const theirNotifiedNewer = (remote.notifiedU || 0) > (local.notifiedU || 0);
     const theirStockNewer = (remote.stockU || 0) > (local.stockU || 0);
+    const theirAdminNewer = !!remote.admin && (remote.adminU || 0) > (local.adminU || 0);
     const state = {
         ...local,
         members: mergeLists(local.members, remote.members, deleted.members),
@@ -17760,6 +17763,8 @@ function mergeStates(local, remote, catalogue) {
         stockHistory: theirStockNewer ? remote.stockHistory || [] : local.stockHistory || [],
         missing: theirStockNewer ? remote.missing || {} : local.missing || {},
         stockU: Math.max(local.stockU || 0, remote.stockU || 0),
+        admin: theirAdminNewer ? remote.admin : local.admin || remote.admin || null,
+        adminU: Math.max(local.adminU || 0, remote.adminU || 0),
         notifiedU: Math.max(local.notifiedU || 0, remote.notifiedU || 0),
         settings: theirSettingsNewer ? { ...local.settings, ...remote.settings } : local.settings,
         settingsU: Math.max(local.settingsU || 0, remote.settingsU || 0),
@@ -18454,6 +18459,15 @@ body.printing{background:#fff !important}
 .pr-notice p{margin:6px 0}
 .pr-notice ul{margin:4px 0 6px 18px;padding:0}
 }
+.cm.cm-gated{padding-left:0 !important;background:var(--ink)}
+.gate{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:calc(24px + env(safe-area-inset-top)) 16px 24px;background:var(--ink)}
+.gate-card{background:var(--bg);border-radius:18px;padding:24px 20px 26px;width:100%;max-width:420px;box-shadow:0 10px 40px rgba(0,0,0,.25)}
+.gate-badge{width:52px;height:52px;border-radius:14px;background:var(--ink);color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 10px}
+.gate-lib{text-align:center;font-size:13px;color:var(--muted);font-weight:600}
+.gate-title{text-align:center;font-size:22px;margin:2px 0 6px;letter-spacing:-.01em}
+.gate-sub{text-align:center;color:var(--muted);font-size:14px;margin:0 0 10px}
+.gate-code{font-family:'Courier New',Courier,monospace;font-size:24px;font-weight:700;letter-spacing:.08em;text-align:center;background:#fff;border:1.5px dashed var(--brass);border-radius:10px;padding:10px;margin:10px 0}
+.gate-otp{font-family:'Courier New',Courier,monospace;font-size:22px;letter-spacing:.2em;text-align:center}
 .save-bar{background:var(--stamp);color:#fff;font-size:13px;text-align:center;padding:6px 12px}
 `;
 /* ---------- printing ---------- */
@@ -20392,6 +20406,8 @@ function SettingsForm({ ctx }) {
                 actions.saveSettings(f);
                 setSaved(true);
             } }, saved ? "Rules saved" : "Save rules"),
+        React.createElement("h2", { className: "sec" }, "Admin login"),
+        React.createElement(AdminPanel, { ctx: ctx }),
         React.createElement("h2", { className: "sec" }, "Sync across your devices"),
         React.createElement(SyncPanel, { ctx: ctx }),
         React.createElement("h2", { className: "sec" }, "Borrowers"),
@@ -20575,6 +20591,639 @@ function SettingsForm({ ctx }) {
             confirmReset ? "Tap again to erase everything" : "Erase all borrowers and loans")));
 }
 /* ---------- app ---------- */
+"use strict";
+/* ---------- admin login ---------- */
+const ADMIN_SESSION = "circulation-desk:admin-session";
+const ADMIN_OTP = "circulation-desk:admin-otp";
+const LockIcon = mkIcon('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>');
+const ADMIN_LOCK_CHOICES = [
+    [0, "Every time the app is opened"],
+    [5, "After 5 minutes without use"],
+    [30, "After 30 minutes without use"],
+    [120, "After 2 hours without use"],
+    [480, "After 8 hours without use"],
+];
+const OTP_MINUTES = 10;
+const canCrypto = () => typeof crypto !== "undefined" && !!crypto.subtle && !!crypto.getRandomValues;
+const b64 = (bytes) => btoa(String.fromCharCode.apply(null, Array.from(bytes)));
+const newSalt = () => b64(crypto.getRandomValues(new Uint8Array(16)));
+async function pbkdf2(secret, salt) {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", enc.encode(secret), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: enc.encode(salt), iterations: 150000, hash: "SHA-256" }, key, 256);
+    return b64(new Uint8Array(bits));
+}
+const sameId = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+const RC_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function newRecoveryCode() {
+    const r = crypto.getRandomValues(new Uint8Array(12));
+    const c = Array.from(r, (x) => RC_ALPHABET[x % RC_ALPHABET.length]).join("");
+    return `${c.slice(0, 4)}-${c.slice(4, 8)}-${c.slice(8, 12)}`;
+}
+const normCode = (v) => String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+function newOtp() {
+    const r = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
+    return String(r).padStart(6, "0");
+}
+const maskEmail = (e) => {
+    const [u, d] = String(e || "").split("@");
+    if (!d)
+        return e || "";
+    return `${u.slice(0, 2)}${"•".repeat(Math.max(1, u.length - 2))}@${d}`;
+};
+const mailReady = (admin) => !!(admin && admin.email && admin.mail && admin.mail.service && admin.mail.template && admin.mail.key);
+function adminSessionLive(admin) {
+    if (!admin)
+        return false;
+    try {
+        const sess = JSON.parse(localStorage.getItem(ADMIN_SESSION) || "null");
+        return !!(sess && sameId(sess.id, admin.id) && sess.until > Date.now());
+    }
+    catch (e) {
+        return false;
+    }
+}
+function startAdminSession(admin) {
+    const mins = admin.lockAfter === undefined ? 30 : admin.lockAfter;
+    try {
+        if (mins > 0)
+            localStorage.setItem(ADMIN_SESSION, JSON.stringify({ id: admin.id, until: Date.now() + mins * 60000 }));
+        else
+            localStorage.removeItem(ADMIN_SESSION);
+    }
+    catch (e) {
+        /* ignore */
+    }
+}
+function touchAdminSession(admin) {
+    if (!admin || !(admin.lockAfter > 0))
+        return;
+    try {
+        const sess = JSON.parse(localStorage.getItem(ADMIN_SESSION) || "null");
+        if (sess && sess.until > Date.now()) {
+            sess.until = Date.now() + admin.lockAfter * 60000;
+            localStorage.setItem(ADMIN_SESSION, JSON.stringify(sess));
+        }
+    }
+    catch (e) {
+        /* ignore */
+    }
+}
+function endAdminSession() {
+    try {
+        localStorage.removeItem(ADMIN_SESSION);
+    }
+    catch (e) {
+        /* ignore */
+    }
+}
+async function sendOtpEmail(admin, otp, library) {
+    const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            service_id: admin.mail.service.trim(),
+            template_id: admin.mail.template.trim(),
+            user_id: admin.mail.key.trim(),
+            template_params: {
+                to_email: admin.email,
+                otp,
+                passcode: otp,
+                minutes: String(OTP_MINUTES),
+                library: library || "Library Circulation",
+                admin_id: admin.id,
+            },
+        }),
+    });
+    if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        const err = new Error(text || `HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+}
+const mailErrorText = (e) => {
+    const t = String((e && e.message) || "");
+    if (e && e.status === 400 && /service/i.test(t))
+        return "EmailJS didn't recognise the Service ID.";
+    if (e && e.status === 400 && /template/i.test(t))
+        return "EmailJS didn't recognise the Template ID.";
+    if (e && (e.status === 400 || e.status === 401 || e.status === 403) && /public key|user id|account/i.test(t))
+        return "EmailJS didn't accept the Public Key.";
+    if (e && e.status === 426)
+        return "EmailJS needs browser sending allowed for this account.";
+    if (e && e.status === 429)
+        return "Too many emails sent just now. Wait a minute and try again.";
+    if (e && e.status)
+        return `EmailJS refused the email: ${t.slice(0, 120) || e.status}.`;
+    return "Couldn't reach the email service. Check the internet connection.";
+};
+function GateShell({ title, sub, children, library }) {
+    return (React.createElement("div", { className: "gate" },
+        React.createElement("div", { className: "gate-card" },
+            React.createElement("div", { className: "gate-badge", "aria-hidden": "true" },
+                React.createElement(LockIcon, { size: 26 })),
+            React.createElement("div", { className: "gate-lib" }, library || "Library Circulation"),
+            React.createElement("h1", { className: "gate-title" }, title),
+            sub && React.createElement("p", { className: "gate-sub" }, sub),
+            children)));
+}
+function PasswordField({ label, value, onChange, onEnter, auto }) {
+    const [show, setShow] = useState(false);
+    return (React.createElement("label", { className: "field" },
+        React.createElement("span", null, label),
+        React.createElement("div", { style: { display: "flex", gap: 8 } },
+            React.createElement("input", { className: "input", type: show ? "text" : "password", value: value, autoComplete: auto || "current-password", onChange: (e) => onChange(e.target.value), onKeyDown: (e) => e.key === "Enter" && onEnter && onEnter() }),
+            React.createElement("button", { type: "button", className: "btn btn-ghost", style: { flexShrink: 0 }, onClick: () => setShow(!show) }, show ? "Hide" : "Show"))));
+}
+function RecoveryCodeCard({ code, onDone, doneLabel }) {
+    const [copied, setCopied] = useState(false);
+    const [ack, setAck] = useState(false);
+    return (React.createElement("div", null,
+        React.createElement("div", { className: "notice caution", style: { marginTop: 0 } },
+            React.createElement("b", null, "Your recovery code"),
+            React.createElement("div", { className: "gate-code" }, code),
+            "Write this down and keep it somewhere safe, away from the iPad. If you forget the password and no OTP email arrives, this code lets you set a new password. It is shown only now.",
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-ghost", onClick: async () => setCopied(await copyText(code)) }, copied ? "Copied" : "Copy code"))),
+        React.createElement("label", { className: "check" },
+            React.createElement("input", { type: "checkbox", checked: ack, onChange: (e) => setAck(e.target.checked) }),
+            "I've written the recovery code down"),
+        React.createElement("button", { className: "btn btn-primary btn-block", style: { marginTop: 14 }, disabled: !ack, onClick: onDone }, doneLabel || "Continue")));
+}
+function AdminSetup({ ctx, onCreated }) {
+    const [id, setId] = useState("admin");
+    const [email, setEmail] = useState("");
+    const [pw, setPw] = useState("");
+    const [pw2, setPw2] = useState("");
+    const [err, setErr] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [code, setCode] = useState(null);
+    const [made, setMade] = useState(null);
+    const [showSync, setShowSync] = useState(false);
+    const lib = ctx.s.library;
+    if (code)
+        return (React.createElement(GateShell, { library: lib, title: "Admin login created", sub: "One last step." },
+            React.createElement(RecoveryCodeCard, { code: code, onDone: () => onCreated(made), doneLabel: "Open the app" })));
+    const create = async () => {
+        setErr("");
+        if (!id.trim() || /\s/.test(id.trim()))
+            return setErr("Choose an admin ID with no spaces, such as admin.");
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim()))
+            return setErr("Enter the email address where OTP codes should go.");
+        if (pw.length < 8)
+            return setErr("Use a password of at least 8 characters.");
+        if (pw !== pw2)
+            return setErr("The two passwords don't match.");
+        setBusy(true);
+        try {
+            const salt = newSalt();
+            const rc = newRecoveryCode();
+            const recSalt = newSalt();
+            const admin = {
+                id: id.trim(),
+                email: email.trim(),
+                salt,
+                hash: await pbkdf2(pw, salt),
+                recSalt,
+                recHash: await pbkdf2(normCode(rc), recSalt),
+                lockAfter: 30,
+                mail: { service: "", template: "", key: "" },
+                created: todayISO(),
+            };
+            setMade(admin);
+            setCode(rc);
+        }
+        catch (e) {
+            setErr("This device couldn't create the login. Open the app from its https address.");
+        }
+        setBusy(false);
+    };
+    return (React.createElement(GateShell, { library: lib, title: "Create the admin login", sub: "From now on, the app opens only after the admin signs in. Your borrowers, loans and books are kept as they are." },
+        React.createElement("label", { className: "field" },
+            React.createElement("span", null, "Admin ID"),
+            React.createElement("input", { className: "input", value: id, autoCapitalize: "none", autoCorrect: "off", onChange: (e) => setId(e.target.value) })),
+        React.createElement("label", { className: "field" },
+            React.createElement("span", null, "Email for OTP codes"),
+            React.createElement("input", { className: "input", type: "email", value: email, autoCapitalize: "none", placeholder: "you@gmail.com", onChange: (e) => setEmail(e.target.value) }),
+            React.createElement("em", null, "Forgotten-password codes are sent here.")),
+        React.createElement(PasswordField, { label: "Password (8 characters or more)", value: pw, onChange: setPw, auto: "new-password" }),
+        React.createElement(PasswordField, { label: "Repeat password", value: pw2, onChange: setPw2, onEnter: create, auto: "new-password" }),
+        err && React.createElement("div", { className: "err" }, err),
+        React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 16 }, disabled: busy, onClick: create }, busy ? "Creating…" : "Create admin login"),
+        React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 14, border: 0 }, onClick: () => setShowSync(!showSync) }, "Already have an admin login on another device?"),
+        showSync && (React.createElement("div", { style: { marginTop: 6 } },
+            React.createElement("p", { className: "gate-sub", style: { textAlign: "left" } }, "Connect this device to the same online storage. The existing admin login comes across, and this screen changes to sign-in."),
+            React.createElement(SyncPanel, { ctx: ctx })))));
+}
+function AdminLogin({ ctx, admin, onSignedIn, onForgot }) {
+    const [id, setId] = useState("");
+    const [pw, setPw] = useState("");
+    const [err, setErr] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [fails, setFails] = useState(0);
+    const [waitUntil, setWaitUntil] = useState(0);
+    const [nowT, setNowT] = useState(Date.now());
+    useEffect(() => {
+        if (waitUntil <= Date.now())
+            return;
+        const t = setInterval(() => setNowT(Date.now()), 500);
+        return () => clearInterval(t);
+    }, [waitUntil]);
+    const waiting = waitUntil > nowT;
+    const go = async () => {
+        if (waiting || busy)
+            return;
+        setErr("");
+        setBusy(true);
+        let ok = false;
+        try {
+            ok = sameId(id, admin.id) && (await pbkdf2(pw, admin.salt)) === admin.hash;
+        }
+        catch (e) {
+            setErr("This device couldn't check the password. Open the app from its https address.");
+            setBusy(false);
+            return;
+        }
+        setBusy(false);
+        if (ok)
+            return onSignedIn();
+        const n = fails + 1;
+        setFails(n);
+        setPw("");
+        if (n >= 5) {
+            setWaitUntil(Date.now() + 30000);
+            setNowT(Date.now());
+            setFails(0);
+            setErr("Too many wrong tries. Wait 30 seconds, or use Forgot password.");
+        }
+        else
+            setErr("The admin ID or password is wrong.");
+    };
+    return (React.createElement(GateShell, { library: ctx.s.library, title: "Admin login", sub: "Sign in to open Library Circulation." },
+        React.createElement("label", { className: "field" },
+            React.createElement("span", null, "Admin ID"),
+            React.createElement("input", { className: "input", value: id, autoCapitalize: "none", autoCorrect: "off", autoComplete: "username", onChange: (e) => setId(e.target.value), onKeyDown: (e) => e.key === "Enter" && go() })),
+        React.createElement(PasswordField, { label: "Password", value: pw, onChange: setPw, onEnter: go }),
+        err && React.createElement("div", { className: "err" }, err),
+        React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 16 }, disabled: busy || waiting || !id || !pw, onClick: go }, busy ? "Checking…" : waiting ? `Wait ${Math.ceil((waitUntil - nowT) / 1000)} s` : "Sign in"),
+        React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 12, border: 0, color: "var(--out)" }, onClick: onForgot }, "Forgot password?")));
+}
+function AdminForgot({ ctx, admin, onBack, onReset }) {
+    const lib = ctx.s.library;
+    const [mode, setMode] = useState(mailReady(admin) ? "otp" : "code");
+    const [stage, setStage] = useState("ask"); // ask -> verify -> newpw -> done
+    const [otpIn, setOtpIn] = useState("");
+    const [codeIn, setCodeIn] = useState("");
+    const [pw, setPw] = useState("");
+    const [pw2, setPw2] = useState("");
+    const [err, setErr] = useState("");
+    const [info, setInfo] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [resendAt, setResendAt] = useState(0);
+    const [nowT, setNowT] = useState(Date.now());
+    const [newCode, setNewCode] = useState(null);
+    const [proof, setProof] = useState(false);
+    useEffect(() => {
+        const t = setInterval(() => setNowT(Date.now()), 1000);
+        return () => clearInterval(t);
+    }, []);
+    // An OTP already sent survives the app being closed while the email is read.
+    useEffect(() => {
+        try {
+            const o = JSON.parse(localStorage.getItem(ADMIN_OTP) || "null");
+            if (o && o.exp > Date.now() && sameId(o.id, admin.id)) {
+                setStage("verify");
+                setMode("otp");
+                setResendAt(o.sent + 60000);
+                setInfo(`A code was sent to ${maskEmail(admin.email)}. It works until ${new Date(o.exp).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })}.`);
+            }
+        }
+        catch (e) {
+            /* ignore */
+        }
+    }, []);
+    const send = async () => {
+        setErr("");
+        setInfo("");
+        if (!navigator.onLine)
+            return setErr("No internet connection. Connect, or use your recovery code instead.");
+        setBusy(true);
+        try {
+            const otp = newOtp();
+            const salt = newSalt();
+            const rec = { id: admin.id, salt, hash: await pbkdf2(otp, salt), exp: Date.now() + OTP_MINUTES * 60000, sent: Date.now(), tries: 0 };
+            await sendOtpEmail(admin, otp, lib);
+            localStorage.setItem(ADMIN_OTP, JSON.stringify(rec));
+            setStage("verify");
+            setResendAt(Date.now() + 60000);
+            setOtpIn("");
+            setInfo(`A 6-digit code was sent to ${maskEmail(admin.email)}. It works for ${OTP_MINUTES} minutes. Check Spam if it isn't in the inbox.`);
+        }
+        catch (e) {
+            setErr(`${mailErrorText(e)} You can use your recovery code instead.`);
+        }
+        setBusy(false);
+    };
+    const verifyOtp = async () => {
+        setErr("");
+        let rec = null;
+        try {
+            rec = JSON.parse(localStorage.getItem(ADMIN_OTP) || "null");
+        }
+        catch (e) {
+            rec = null;
+        }
+        if (!rec || rec.exp < Date.now()) {
+            localStorage.removeItem(ADMIN_OTP);
+            setStage("ask");
+            return setErr("That code has expired. Send a new one.");
+        }
+        const clean = otpIn.replace(/\D/g, "");
+        if (clean.length !== 6)
+            return setErr("Enter the 6 digits from the email.");
+        setBusy(true);
+        const ok = (await pbkdf2(clean, rec.salt)) === rec.hash;
+        setBusy(false);
+        if (ok) {
+            localStorage.removeItem(ADMIN_OTP);
+            setProof(true);
+            setStage("newpw");
+            setInfo("");
+            return;
+        }
+        rec.tries = (rec.tries || 0) + 1;
+        if (rec.tries >= 5) {
+            localStorage.removeItem(ADMIN_OTP);
+            setStage("ask");
+            return setErr("Too many wrong codes. Send a new one.");
+        }
+        localStorage.setItem(ADMIN_OTP, JSON.stringify(rec));
+        setOtpIn("");
+        setErr(`That code isn't right. ${5 - rec.tries} tries left.`);
+    };
+    const verifyCode = async () => {
+        setErr("");
+        if (normCode(codeIn).length !== 12)
+            return setErr("The recovery code has 12 letters and numbers, like ABCD-EFGH-JKLM.");
+        setBusy(true);
+        const ok = admin.recHash && (await pbkdf2(normCode(codeIn), admin.recSalt)) === admin.recHash;
+        setBusy(false);
+        if (!ok)
+            return setErr("That recovery code isn't right.");
+        setProof(true);
+        setStage("newpw");
+    };
+    const save = async () => {
+        setErr("");
+        if (!proof)
+            return;
+        if (pw.length < 8)
+            return setErr("Use a password of at least 8 characters.");
+        if (pw !== pw2)
+            return setErr("The two passwords don't match.");
+        setBusy(true);
+        const salt = newSalt();
+        const next = { ...admin, salt, hash: await pbkdf2(pw, salt) };
+        let rc = null;
+        if (mode === "code") {
+            // a used recovery code is replaced with a fresh one
+            rc = newRecoveryCode();
+            next.recSalt = newSalt();
+            next.recHash = await pbkdf2(normCode(rc), next.recSalt);
+        }
+        setBusy(false);
+        if (rc) {
+            setNewCode({ rc, next });
+            setStage("done");
+        }
+        else
+            onReset(next);
+    };
+    if (stage === "done" && newCode)
+        return (React.createElement(GateShell, { library: lib, title: "Password changed", sub: "Your old recovery code no longer works. Here is the new one." },
+            React.createElement(RecoveryCodeCard, { code: newCode.rc, onDone: () => onReset(newCode.next), doneLabel: "Open the app" })));
+    if (stage === "newpw")
+        return (React.createElement(GateShell, { library: lib, title: "Set a new password", sub: `Admin ID: ${admin.id}` },
+            React.createElement(PasswordField, { label: "New password (8 characters or more)", value: pw, onChange: setPw, auto: "new-password" }),
+            React.createElement(PasswordField, { label: "Repeat new password", value: pw2, onChange: setPw2, onEnter: save, auto: "new-password" }),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 16 }, disabled: busy, onClick: save }, busy ? "Saving…" : "Save new password")));
+    return (React.createElement(GateShell, { library: lib, title: "Forgot password", sub: `Admin ID: ${admin.id}` },
+        React.createElement("div", { className: "seg" },
+            React.createElement("button", { "aria-pressed": mode === "otp", onClick: () => { setMode("otp"); setErr(""); } }, "OTP by email"),
+            React.createElement("button", { "aria-pressed": mode === "code", onClick: () => { setMode("code"); setErr(""); } }, "Recovery code")),
+        mode === "otp" ? (!mailReady(admin) ? (React.createElement("div", { className: "notice caution" }, "OTP emails aren't set up yet. Use your recovery code now; once you're in, set up OTP emails in Loan rules, under Admin login.")) : stage === "ask" ? (React.createElement(React.Fragment, null,
+            React.createElement("p", { className: "gate-sub", style: { textAlign: "left" } },
+                "A 6-digit code will be emailed to ",
+                React.createElement("b", null, maskEmail(admin.email)),
+                "."),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 8 }, disabled: busy, onClick: send }, busy ? "Sending…" : "Send OTP"))) : (React.createElement(React.Fragment, null,
+            info && React.createElement("div", { className: "notice", style: { marginTop: 0 } }, info),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "6-digit code"),
+                React.createElement("input", { className: "input gate-otp", inputMode: "numeric", autoComplete: "one-time-code", maxLength: 7, value: otpIn, onChange: (e) => setOtpIn(e.target.value.replace(/[^\d]/g, "")), onKeyDown: (e) => e.key === "Enter" && verifyOtp() })),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 14 }, disabled: busy, onClick: verifyOtp }, busy ? "Checking…" : "Verify code"),
+            React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 10 }, disabled: busy || resendAt > nowT, onClick: send }, resendAt > nowT ? `Send again in ${Math.ceil((resendAt - nowT) / 1000)} s` : "Send a new code")))) : (React.createElement(React.Fragment, null,
+            React.createElement("label", { className: "field", style: { marginTop: 0 } },
+                React.createElement("span", null, "Recovery code"),
+                React.createElement("input", { className: "input gate-otp", autoCapitalize: "characters", autoCorrect: "off", placeholder: "ABCD-EFGH-JKLM", value: codeIn, onChange: (e) => setCodeIn(e.target.value), onKeyDown: (e) => e.key === "Enter" && verifyCode() }),
+                React.createElement("em", null, "The code you wrote down when the admin login was created. It works without internet.")),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 14 }, disabled: busy, onClick: verifyCode }, busy ? "Checking…" : "Use recovery code"))),
+        React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 14, border: 0 }, onClick: onBack }, "Back to sign in")));
+}
+function AdminGate({ ctx, admin, onUnlock, saveAdmin }) {
+    const [screen, setScreen] = useState("login");
+    if (!canCrypto())
+        return (React.createElement(GateShell, { library: ctx.s.library, title: "Open the app from its web address" },
+            React.createElement("p", { className: "gate-sub" }, "The admin login needs the secure https address of the app. Open it from your GitHub Pages link.")));
+    if (!admin)
+        return (React.createElement(AdminSetup, { ctx: ctx, onCreated: (a) => {
+                saveAdmin(a);
+                onUnlock(a);
+            } }));
+    if (screen === "forgot")
+        return (React.createElement(AdminForgot, { ctx: ctx, admin: admin, onBack: () => setScreen("login"), onReset: (a) => {
+                saveAdmin(a);
+                onUnlock(a);
+            } }));
+    return React.createElement(AdminLogin, { ctx: ctx, admin: admin, onSignedIn: () => onUnlock(admin), onForgot: () => setScreen("forgot") });
+}
+/* settings section, shown only to the signed-in admin */
+function AdminPanel({ ctx }) {
+    const { state, adminLock, saveAdmin } = ctx;
+    const admin = state.admin;
+    const [mode, setMode] = useState(null); // "password" | "email" | "mail" | "code"
+    const [cur, setCur] = useState("");
+    const [pw, setPw] = useState("");
+    const [pw2, setPw2] = useState("");
+    const [email, setEmail] = useState(admin ? admin.email : "");
+    const [mail, setMail] = useState(() => ({ service: "", template: "", key: "", ...((admin && admin.mail) || {}) }));
+    const [err, setErr] = useState("");
+    const [ok, setOk] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [rc, setRc] = useState(null);
+    if (!admin)
+        return null;
+    const reset = (m) => {
+        setMode(m);
+        setErr("");
+        setOk("");
+        setCur("");
+        setPw("");
+        setPw2("");
+    };
+    const checkCurrent = async () => (await pbkdf2(cur, admin.salt)) === admin.hash;
+    const savePassword = async () => {
+        setErr("");
+        setBusy(true);
+        try {
+            if (!(await checkCurrent()))
+                return setErr("The current password is wrong.");
+            if (pw.length < 8)
+                return setErr("Use a password of at least 8 characters.");
+            if (pw !== pw2)
+                return setErr("The two new passwords don't match.");
+            const salt = newSalt();
+            saveAdmin({ ...admin, salt, hash: await pbkdf2(pw, salt) });
+            reset(null);
+            setOk("Password changed.");
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    const saveEmail = async () => {
+        setErr("");
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim()))
+            return setErr("Enter a valid email address.");
+        setBusy(true);
+        try {
+            if (!(await checkCurrent()))
+                return setErr("The current password is wrong.");
+            saveAdmin({ ...admin, email: email.trim() });
+            reset(null);
+            setOk("Email changed.");
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    const saveMail = async (test) => {
+        setErr("");
+        setOk("");
+        const m = { service: mail.service.trim(), template: mail.template.trim(), key: mail.key.trim() };
+        if (!m.service || !m.template || !m.key)
+            return setErr("Fill in all three EmailJS values.");
+        const next = { ...admin, mail: m };
+        saveAdmin(next);
+        if (!test) {
+            setOk("Saved.");
+            return;
+        }
+        setBusy(true);
+        try {
+            await sendOtpEmail(next, "123456", ctx.s.library);
+            setOk(`Test email sent to ${admin.email}, with the sample code 123456. If it arrived, OTP emails are working.`);
+        }
+        catch (e) {
+            setErr(mailErrorText(e));
+        }
+        setBusy(false);
+    };
+    const newCode = async () => {
+        setErr("");
+        setBusy(true);
+        try {
+            if (!(await checkCurrent()))
+                return setErr("The current password is wrong.");
+            const code = newRecoveryCode();
+            const recSalt = newSalt();
+            saveAdmin({ ...admin, recSalt, recHash: await pbkdf2(normCode(code), recSalt) });
+            setRc(code);
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    if (rc)
+        return (React.createElement(RecoveryCodeCard, { code: rc, doneLabel: "Done", onDone: () => {
+                setRc(null);
+                reset(null);
+                setOk("New recovery code saved. The old one no longer works.");
+            } }));
+    return (React.createElement("div", null,
+        React.createElement("div", { className: "facts", style: { marginTop: 0 } },
+            React.createElement("div", null,
+                React.createElement("dt", null, "Admin ID"),
+                React.createElement("dd", null, admin.id)),
+            React.createElement("div", null,
+                React.createElement("dt", null, "OTP email"),
+                React.createElement("dd", { style: { overflowWrap: "anywhere" } }, admin.email)),
+            React.createElement("div", null,
+                React.createElement("dt", null, "OTP emails"),
+                React.createElement("dd", { style: { color: mailReady(admin) ? "var(--ink)" : "var(--brass)" } }, mailReady(admin) ? "Set up" : "Not set up yet")),
+            React.createElement("div", null,
+                React.createElement("dt", null, "Locks"),
+                React.createElement("dd", null, (ADMIN_LOCK_CHOICES.find(([v]) => v === (admin.lockAfter === undefined ? 30 : admin.lockAfter)) || [0, ""])[1]))),
+        ok && React.createElement("div", { className: "notice" }, ok),
+        mode === "password" && (React.createElement("div", { className: "notice caution" },
+            React.createElement(PasswordField, { label: "Current password", value: cur, onChange: setCur }),
+            React.createElement(PasswordField, { label: "New password (8 characters or more)", value: pw, onChange: setPw, auto: "new-password" }),
+            React.createElement(PasswordField, { label: "Repeat new password", value: pw2, onChange: setPw2, onEnter: savePassword, auto: "new-password" }),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset(null) }, "Cancel"),
+                React.createElement("button", { className: "btn btn-primary", disabled: busy, onClick: savePassword }, "Change password")))),
+        mode === "email" && (React.createElement("div", { className: "notice caution" },
+            React.createElement("label", { className: "field", style: { marginTop: 0 } },
+                React.createElement("span", null, "New email for OTP codes"),
+                React.createElement("input", { className: "input", type: "email", autoCapitalize: "none", value: email, onChange: (e) => setEmail(e.target.value) })),
+            React.createElement(PasswordField, { label: "Current password", value: cur, onChange: setCur, onEnter: saveEmail }),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset(null) }, "Cancel"),
+                React.createElement("button", { className: "btn btn-primary", disabled: busy, onClick: saveEmail }, "Change email")))),
+        mode === "code" && (React.createElement("div", { className: "notice caution" },
+            "Making a new recovery code stops the old one working.",
+            React.createElement(PasswordField, { label: "Current password", value: cur, onChange: setCur, onEnter: newCode }),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset(null) }, "Cancel"),
+                React.createElement("button", { className: "btn btn-primary", disabled: busy, onClick: newCode }, "Make new code")))),
+        mode === "mail" && (React.createElement("div", { className: "notice caution" },
+            React.createElement("p", { style: { margin: "0 0 6px", fontSize: 13 } }, "OTP emails go through a free EmailJS account linked to your Gmail. The Admin login setup guide explains where to find these three values."),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Service ID"),
+                React.createElement("input", { className: "input", autoCapitalize: "none", autoCorrect: "off", placeholder: "service_xxxxxxx", value: mail.service, onChange: (e) => setMail({ ...mail, service: e.target.value }) })),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Template ID"),
+                React.createElement("input", { className: "input", autoCapitalize: "none", autoCorrect: "off", placeholder: "template_xxxxxxx", value: mail.template, onChange: (e) => setMail({ ...mail, template: e.target.value }) })),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Public Key"),
+                React.createElement("input", { className: "input", autoCapitalize: "none", autoCorrect: "off", value: mail.key, onChange: (e) => setMail({ ...mail, key: e.target.value }) })),
+            err && React.createElement("div", { className: "err" }, err),
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset(null) }, "Close"),
+                React.createElement("button", { className: "btn btn-ghost", disabled: busy, onClick: () => saveMail(false) }, "Save"),
+                React.createElement("button", { className: "btn btn-primary", disabled: busy, onClick: () => saveMail(true) }, busy ? "Sending…" : "Save and send a test email")))),
+        !mode && (React.createElement(React.Fragment, null,
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Ask for the password"),
+                React.createElement("select", { className: "select", value: String(admin.lockAfter === undefined ? 30 : admin.lockAfter), onChange: (e) => { const next = { ...admin, lockAfter: Number(e.target.value) }; startAdminSession(next); saveAdmin(next); } }, ADMIN_LOCK_CHOICES.map(([v, label]) => (React.createElement("option", { key: v, value: v }, label))))),
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-primary", onClick: adminLock },
+                    React.createElement(LockIcon, { size: 17 }),
+                    " Lock now"),
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset("password") }, "Change password"),
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset("mail") }, mailReady(admin) ? "OTP email settings" : "Set up OTP emails"),
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset("email") }, "Change OTP email"),
+                React.createElement("button", { className: "btn btn-ghost", onClick: () => reset("code") }, "New recovery code"))))));
+}
+
 function App() {
     const [state, setState] = useState(null);
     const [saveError, setSaveError] = useState(false);
@@ -20585,6 +21234,8 @@ function App() {
     const hydrated = useRef(false);
     const [hintOff, setHintOff] = useState(() => local.flag(HINT_KEY) === "off");
     const [sync, setSync] = useState(() => loadSync());
+    const [adminOk, setAdminOk] = useState(false);
+    const [, setLockTick] = useState(0);
     const [syncState, setSyncState] = useState({ busy: false, at: null, error: null });
     const stateRef = useRef(null);
     const syncingRef = useRef(false);
@@ -20737,6 +21388,23 @@ function App() {
             memberById: new Map(state.members.map((m) => [m.id, m])),
         };
     }, [state, today]);
+    useEffect(() => {
+        // idle lock: re-check the admin session every 20 seconds, and on leaving the app when set to "every time"
+        const t = setInterval(() => {
+            const a = stateRef.current && stateRef.current.admin;
+            if (a && a.lockAfter > 0 && !adminSessionLive(a)) setAdminOk(false);
+            setLockTick((n) => n + 1);
+        }, 20000);
+        const onHide = () => {
+            const a = stateRef.current && stateRef.current.admin;
+            if (document.hidden && a && !(a.lockAfter > 0)) setAdminOk(false);
+        };
+        document.addEventListener("visibilitychange", onHide);
+        return () => {
+            clearInterval(t);
+            document.removeEventListener("visibilitychange", onHide);
+        };
+    }, []);
     const close = useCallback(() => setSheet(null), []);
     const open = useCallback((type, props = {}) => setSheet({ type, key: Date.now(), ...props }), []);
     if (!state) {
@@ -20870,6 +21538,8 @@ function App() {
         saveSettings: (f) => setState((p) => ({ ...p, settings: { ...f }, settingsU: now() })),
         resetAll: () => setState((p) => ({
             ...DEFAULT_STATE,
+            admin: p.admin,
+            adminU: p.adminU,
             settings: p.settings,
             settingsU: now(),
             lastBackup: p.lastBackup,
@@ -20891,8 +21561,10 @@ function App() {
                     setSaveError(true);
                 }
             }
-            setState(() => ({
+            setState((p) => ({
                 ...next,
+                admin: next.admin || p.admin,
+                adminU: next.admin ? now() : p.adminU,
                 members: (next.members || []).map((m) => stamp(m)),
                 loans: (next.loans || []).map((l) => stamp(l)),
                 settingsU: now(),
@@ -20963,8 +21635,15 @@ function App() {
                 : syncState.at
                     ? "Saved online"
                     : "Connecting…";
+    const saveAdmin = (a) => setState((p) => ({ ...p, admin: { ...a, u: now() }, adminU: now() }));
+    const adminLock = () => {
+        endAdminSession();
+        setAdminOk(false);
+        setSheet(null);
+    };
+    const adminUnlocked = !!state.admin && (adminSessionLive(state.admin) || (adminOk && !(state.admin.lockAfter > 0)) || (adminOk && adminSessionLive(state.admin)));
     const ctx = {
-        state, d, today, s, actions, open, close, sync, syncState, connected,
+        state, d, today, s, actions, open, close, sync, syncState, connected, saveAdmin, adminLock,
         connectSync: async (cfg) => {
             const out = await runSync(cfg, "create");
             return out;
@@ -21010,7 +21689,21 @@ function App() {
         bookForm: "Book",
         message: "Message borrower",
     };
-    return (React.createElement("div", { className: "cm" },
+    if (!adminUnlocked) {
+        return (React.createElement("div", { className: "cm cm-gated" },
+            React.createElement("style", null, CSS),
+            React.createElement(AdminGate, {
+                ctx,
+                admin: state.admin,
+                saveAdmin,
+                onUnlock: (a) => {
+                    startAdminSession(a);
+                    setAdminOk(true);
+                    setSheet(null);
+                },
+            })));
+    }
+    return (React.createElement("div", { className: "cm", onPointerDown: () => touchAdminSession(state.admin), onKeyDown: () => touchAdminSession(state.admin) },
         React.createElement("style", null, CSS),
         React.createElement("header", { className: "cm-top" },
             saveError && React.createElement("div", { className: "save-bar" }, "Changes couldn't be saved. The iPad may be out of storage. Save a backup from Loan rules."),
@@ -21021,6 +21714,8 @@ function App() {
                 React.createElement("button", { className: "cloud", onClick: () => open("settings") },
                     React.createElement("i", { className: `cloud-dot ${cloudTone}`, "aria-hidden": "true" }),
                     cloudLabel),
+                React.createElement("button", { className: "icon-btn", "aria-label": "Lock the app", title: "Lock", onClick: adminLock },
+                    React.createElement(LockIcon, { size: 21 })),
                 React.createElement("button", { className: "icon-btn", "aria-label": "Loan rules and data", onClick: () => open("settings") },
                     React.createElement(Settings, { size: 22 }))),
             React.createElement("div", { className: "cm-stripe", style: { background: STRIPE }, "aria-hidden": "true" })),
