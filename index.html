@@ -18425,7 +18425,11 @@ button.row:disabled{opacity:.62}
 .pr-inline{display:flex;align-items:center;justify-content:space-between;gap:10px}
 #print-area{display:none}
 @media print{
-@page{margin:12mm}
+@page{margin:0;size:auto}
+.pr-frame{width:100%;border-collapse:collapse}
+.pr-frame>thead>tr>td,.pr-frame>tfoot>tr>td,.pr-frame>tbody>tr>td{padding:0;border:0}
+.pr-space{height:12mm}
+.pr{padding:0 12mm}
 body.printing>*:not(#print-area){display:none !important}
 body.printing #print-area{display:block}
 body.printing{background:#fff !important}
@@ -18493,10 +18497,13 @@ function printHtml(title, body, s, kind) {
     const head = kind === "slip"
         ? ""
         : `<header class="pr-head"><div><div class="pr-lib">${hx((s && s.library) || "Library")}</div><h1>${hx(title)}</h1></div><div class="pr-meta">Printed ${hx(prStamp())}</div></header>`;
-    area.innerHTML = `<div class="pr ${kind ? "pr-" + kind : ""}">${head}${body}</div>`;
+    area.innerHTML = `<table class="pr-frame"><thead><tr><td><div class="pr-space"></div></td></tr></thead><tfoot><tr><td><div class="pr-space"></div></td></tr></tfoot><tbody><tr><td><div class="pr ${kind ? "pr-" + kind : ""}">${head}${body}</div></td></tr></tbody></table>`;
     document.body.classList.add("printing");
+    const oldTitle = document.title;
+    document.title = title;
     const done = () => {
         document.body.classList.remove("printing");
+        document.title = oldTitle;
         window.removeEventListener("afterprint", done);
     };
     window.addEventListener("afterprint", done);
