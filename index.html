@@ -18830,6 +18830,10 @@ function DeskView({ ctx }) {
             " Share in Safari, then Add to Home Screen.",
             React.createElement("div", { className: "btn-row" },
                 React.createElement("button", { className: "btn btn-ghost", onClick: ctx.dismissInstall }, "Got it")))),
+        ctx.adminRec && ctx.fileState !== "checking" && !sameLogin(ctx.adminRec, ctx.fileAdmin) && (React.createElement("div", { className: "notice caution" },
+            "Other browsers and devices will ask to create a new admin login until your login is saved to your website.",
+            React.createElement("div", { className: "btn-row" },
+                React.createElement("button", { className: "btn btn-primary", onClick: () => open("settings") }, "Save login to website")))),
         !ctx.connected && (React.createElement("div", { className: "notice caution" },
             "Records are kept on this iPad only. Turn on online storage and every device you use shows the same borrowers, loans and catalogue.",
             React.createElement("div", { className: "btn-row" },
@@ -20422,6 +20426,7 @@ function SettingsForm({ ctx }) {
             } }, saved ? "Rules saved" : "Save rules"),
         React.createElement("h2", { className: "sec" }, "Admin login"),
         React.createElement(AdminPanel, { ctx: ctx }),
+        React.createElement(AdminFilePanel, { ctx: ctx }),
         React.createElement("h2", { className: "sec" }, "Sync across your devices"),
         React.createElement(SyncPanel, { ctx: ctx }),
         React.createElement("h2", { className: "sec" }, "Borrowers"),
@@ -20849,7 +20854,7 @@ function AdminSetup({ ctx, onCreated }) {
             React.createElement("p", { className: "gate-sub", style: { textAlign: "left" } }, "Connect this device to the same online storage. The existing admin login comes across, and this screen changes to sign-in."),
             React.createElement(SyncPanel, { ctx: ctx })))));
 }
-function AdminLogin({ ctx, admin, onSignedIn, onForgot }) {
+function AdminLogin({ ctx, admin, onSignedIn, onForgot, onRecovery }) {
     const [id, setId] = useState("");
     const [pw, setPw] = useState("");
     const [err, setErr] = useState("");
@@ -20906,11 +20911,12 @@ function AdminLogin({ ctx, admin, onSignedIn, onForgot }) {
         React.createElement(PasswordField, { label: "Password", value: pw, onChange: setPw, onEnter: go }),
         err && React.createElement("div", { className: "err" }, err),
         React.createElement("button", { className: "btn btn-primary btn-block btn-big", style: { marginTop: 16 }, disabled: busy || waiting || !id || !pw, onClick: go }, busy ? "Checking…" : waiting ? `Wait ${Math.ceil((waitUntil - nowT) / 1000)} s` : "Sign in"),
-        React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 12, border: 0, color: "var(--out)" }, onClick: onForgot }, "Forgot password?")));
+        React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 12, border: 0, color: "var(--out)" }, onClick: onForgot }, "Forgot password?"),
+        React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 6, border: 0, color: "var(--out)" }, onClick: onRecovery }, "Use recovery code")));
 }
-function AdminForgot({ ctx, admin, onBack, onReset }) {
+function AdminForgot({ ctx, admin, onBack, onReset, startWith }) {
     const lib = ctx.s.library;
-    const [mode, setMode] = useState(mailReady(admin) ? "otp" : "code");
+    const [mode, setMode] = useState(startWith || (mailReady(admin) ? "otp" : "code"));
     const [stage, setStage] = useState("ask"); // ask -> verify -> newpw -> done
     const [otpIn, setOtpIn] = useState("");
     const [codeIn, setCodeIn] = useState("");
@@ -21086,17 +21092,111 @@ function AdminGate({ ctx, admin, onUnlock, saveAdmin }) {
                 saveAdmin(a);
                 onUnlock(a);
             } }));
-    if (screen === "forgot")
-        return (React.createElement(AdminForgot, { ctx: ctx, admin: admin, onBack: () => setScreen("login"), onReset: (a) => {
+    if (screen === "forgot" || screen === "code")
+        return (React.createElement(AdminForgot, { ctx: ctx, admin: admin, startWith: screen === "code" ? "code" : undefined, onBack: () => setScreen("login"), onReset: (a) => {
                 saveAdmin(a);
                 onUnlock(a);
             } }));
-    return React.createElement(AdminLogin, { ctx: ctx, admin: admin, onSignedIn: () => onUnlock(admin), onForgot: () => setScreen("forgot") });
+    return React.createElement(AdminLogin, { ctx: ctx, admin: admin, onSignedIn: () => onUnlock(admin), onForgot: () => setScreen("forgot"), onRecovery: () => setScreen("code") });
 }
 /* settings section, shown only to the signed-in admin */
+"use strict";
+/* ---------- admin login kept on the website (admin.json) ---------- */
+const ADMIN_FILE_COPY = "circulation-desk:admin-file";
+function chooseAdmin(local, file) {
+    if (!local)
+        return file || null;
+    if (!file)
+        return local;
+    // two different admin logins: the one created first wins; the same login: the newest change wins
+    if (local.born && file.born && local.born !== file.born)
+        return local.born < file.born ? local : file;
+    return (local.u || 0) >= (file.u || 0) ? local : file;
+}
+const adminFields = (a) => ({
+    id: a.id,
+    email: a.email,
+    salt: a.salt,
+    hash: a.hash,
+    recSalt: a.recSalt,
+    recHash: a.recHash,
+    born: a.born,
+    created: a.created,
+    lockAfter: a.lockAfter,
+    mail: a.mail,
+    u: a.u,
+});
+const sameLogin = (a, b) => !!a && !!b && a.hash === b.hash && a.recHash === b.recHash && a.id === b.id && a.email === b.email &&
+    JSON.stringify(a.mail || {}) === JSON.stringify(b.mail || {}) && (a.lockAfter || 0) === (b.lockAfter || 0);
+function loadAdminFileCopy() {
+    try {
+        const v = JSON.parse(localStorage.getItem(ADMIN_FILE_COPY) || "null");
+        return v && v.hash ? v : null;
+    }
+    catch (e) {
+        return null;
+    }
+}
+async function fetchAdminFile() {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = setTimeout(() => ctl && ctl.abort(), 6000);
+    try {
+        const res = await fetch(`admin.json?t=${Date.now()}`, { cache: "no-store", signal: ctl ? ctl.signal : undefined });
+        if (res.status === 404)
+            return { state: "none" };
+        if (!res.ok)
+            return { state: "error" };
+        const j = await res.json();
+        if (!j || j.app !== "library-circulation-admin" || !j.admin || !j.admin.hash || !j.admin.salt)
+            return { state: "none" };
+        return { state: "ok", admin: j.admin };
+    }
+    catch (e) {
+        return { state: "error" };
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+function AdminFilePanel({ ctx }) {
+    const { adminRec, fileAdmin, fileState, saveAdmin } = ctx;
+    const [done, setDone] = useState(false);
+    if (!adminRec)
+        return null;
+    const current = sameLogin(adminRec, fileAdmin);
+    const save = async () => {
+        let a = adminRec;
+        if (!a.born) {
+            // older logins get a fixed identity before being shared
+            a = { ...a, born: Date.now() - 1 };
+            saveAdmin(a);
+        }
+        const body = JSON.stringify({ app: "library-circulation-admin", v: 1, saved: new Date().toISOString(), admin: adminFields({ ...a, u: a.u || Date.now() }) }, null, 1);
+        const r = await shareOrDownload("admin.json", body, "application/json");
+        if (r !== "cancelled")
+            setDone(true);
+    };
+    return (React.createElement("div", null,
+        React.createElement("h2", { className: "sec" }, "Login on every device"),
+        current ? (React.createElement("div", { className: "notice", style: { marginTop: 0 } }, "Your website has this admin login. Every browser and device shows the sign-in screen, never \"Create the admin login\".")) : (React.createElement("div", { className: "notice caution", style: { marginTop: 0 } }, fileAdmin
+            ? "The login on your website is older than this one (for example, the old password). Save the file again and upload it, so every device uses the current password."
+            : fileState === "error"
+                ? "Couldn't check your website just now. If admin.json isn't uploaded yet, other browsers will ask to create a new admin login."
+                : "Not on your website yet. Until it is, a new browser, Private Browsing or another device asks to create a new admin login.")),
+        !current && (React.createElement(React.Fragment, null,
+            React.createElement("p", { style: { fontSize: 13, color: "var(--muted)", margin: "8px 0 0" } },
+                "1. Tap the button and save ",
+                React.createElement("b", null, "admin.json"),
+                " to Files. 2. Upload it to your GitHub repository next to index.html (Add file, Upload files, Commit changes). The password itself is never in the file, only a scrambled form of it."),
+            React.createElement("button", { className: "btn btn-primary btn-block", style: { marginTop: 10 }, onClick: save },
+                React.createElement(Download, { size: 18 }),
+                " Save login file (admin.json)"),
+            done && (React.createElement("p", { style: { fontSize: 13, color: "var(--ink)", margin: "8px 0 0" } }, "Saved. Now upload admin.json to GitHub. This message changes once the website has it."))))));
+}
+
 function AdminPanel({ ctx }) {
     const { state, adminLock, saveAdmin } = ctx;
-    const admin = state.admin;
+    const admin = ctx.adminRec || state.admin;
     const [mode, setMode] = useState(null); // "password" | "email" | "mail" | "code"
     const [cur, setCur] = useState("");
     const [pw, setPw] = useState("");
@@ -21278,6 +21378,9 @@ function App() {
     const [hintOff, setHintOff] = useState(() => local.flag(HINT_KEY) === "off");
     const [sync, setSync] = useState(() => loadSync());
     const [adminOk, setAdminOk] = useState(false);
+    const [fileAdmin, setFileAdmin] = useState(() => loadAdminFileCopy());
+    const [fileState, setFileState] = useState("checking");
+    const adminRef = useRef(null);
     const [, setLockTick] = useState(0);
     const [syncState, setSyncState] = useState({ busy: false, at: null, error: null });
     const stateRef = useRef(null);
@@ -21434,12 +21537,12 @@ function App() {
     useEffect(() => {
         // idle lock: re-check the admin session every 20 seconds, and on leaving the app when set to "every time"
         const t = setInterval(() => {
-            const a = stateRef.current && stateRef.current.admin;
+            const a = adminRef.current;
             if (a && a.lockAfter > 0 && !adminSessionLive(a)) setAdminOk(false);
             setLockTick((n) => n + 1);
         }, 20000);
         const onHide = () => {
-            const a = stateRef.current && stateRef.current.admin;
+            const a = adminRef.current;
             if (document.hidden && a && !(a.lockAfter > 0)) setAdminOk(false);
         };
         document.addEventListener("visibilitychange", onHide);
@@ -21447,6 +21550,25 @@ function App() {
             clearInterval(t);
             document.removeEventListener("visibilitychange", onHide);
         };
+    }, []);
+    useEffect(() => {
+        let alive = true;
+        const check = () => fetchAdminFile().then((r) => {
+            if (!alive) return;
+            if (r.state === "ok") {
+                setFileAdmin(r.admin);
+                try { localStorage.setItem(ADMIN_FILE_COPY, JSON.stringify(r.admin)); } catch (e) { }
+            }
+            else if (r.state === "none") {
+                setFileAdmin(null);
+                try { localStorage.removeItem(ADMIN_FILE_COPY); } catch (e) { }
+            }
+            setFileState(r.state);
+        });
+        check();
+        const onShow = () => { if (!document.hidden) check(); };
+        document.addEventListener("visibilitychange", onShow);
+        return () => { alive = false; document.removeEventListener("visibilitychange", onShow); };
     }, []);
     const close = useCallback(() => setSheet(null), []);
     const open = useCallback((type, props = {}) => setSheet({ type, key: Date.now(), ...props }), []);
@@ -21684,9 +21806,11 @@ function App() {
         setAdminOk(false);
         setSheet(null);
     };
-    const adminUnlocked = !!state.admin && (adminSessionLive(state.admin) || (adminOk && !(state.admin.lockAfter > 0)) || (adminOk && adminSessionLive(state.admin)));
+    const adminRec = chooseAdmin(state.admin, fileAdmin);
+    adminRef.current = adminRec;
+    const adminUnlocked = !!adminRec && (adminSessionLive(adminRec) || (adminOk && !(adminRec.lockAfter > 0)));
     const ctx = {
-        state, d, today, s, actions, open, close, sync, syncState, connected, saveAdmin, adminLock,
+        state, d, today, s, actions, open, close, sync, syncState, connected, saveAdmin, adminLock, adminRec, fileAdmin, fileState,
         connectSync: async (cfg) => {
             const out = await runSync(cfg, "create");
             return out;
@@ -21732,12 +21856,18 @@ function App() {
         bookForm: "Book",
         message: "Message borrower",
     };
+    if (!adminRec && fileState === "checking") {
+        // don't flash "Create the admin login" while the website's login file is still loading
+        return (React.createElement("div", { className: "cm cm-gated" },
+            React.createElement("style", null, CSS),
+            React.createElement(GateShell, { library: s.library, title: "Opening\u2026" })));
+    }
     if (!adminUnlocked) {
         return (React.createElement("div", { className: "cm cm-gated" },
             React.createElement("style", null, CSS),
             React.createElement(AdminGate, {
                 ctx,
-                admin: state.admin,
+                admin: adminRec,
                 saveAdmin,
                 onUnlock: (a) => {
                     startAdminSession(a);
@@ -21746,7 +21876,7 @@ function App() {
                 },
             })));
     }
-    return (React.createElement("div", { className: "cm", onPointerDown: () => touchAdminSession(state.admin), onKeyDown: () => touchAdminSession(state.admin) },
+    return (React.createElement("div", { className: "cm", onPointerDown: () => touchAdminSession(adminRec), onKeyDown: () => touchAdminSession(adminRec) },
         React.createElement("style", null, CSS),
         React.createElement("header", { className: "cm-top" },
             saveError && React.createElement("div", { className: "save-bar" }, "Changes couldn't be saved. The iPad may be out of storage. Save a backup from Loan rules."),

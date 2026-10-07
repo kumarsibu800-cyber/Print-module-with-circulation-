@@ -1,7 +1,7 @@
 // Library Circulation offline helper.
 // The app page itself always comes fresh from the internet when there is a connection,
 // and from the saved copy only when offline, so a new upload shows up on the next open.
-const CACHE = "library-circulation-v19";
+const CACHE = "library-circulation-v20";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -24,7 +24,7 @@ self.addEventListener("activate", (e) => {
 const isPage = (req) => {
   if (req.mode === "navigate") return true;
   const p = new URL(req.url).pathname;
-  return p.endsWith("/") || p.endsWith(".html");
+  return p.endsWith("/") || p.endsWith(".html") || p.endsWith("admin.json");
 };
 
 self.addEventListener("fetch", (e) => {
@@ -38,13 +38,17 @@ self.addEventListener("fetch", (e) => {
     e.respondWith(
       fetch(req.url, { cache: "no-cache" })
         .then((res) => {
-          if (res.ok) {
+          if (res.ok && !new URL(req.url).pathname.endsWith("admin.json")) {
             const copy = res.clone();
             caches.open(CACHE).then((c) => c.put("./index.html", copy));
           }
           return res;
         })
-        .catch(() => caches.match("./index.html").then((hit) => hit || caches.match("./")))
+        .catch(() =>
+          new URL(req.url).pathname.endsWith("admin.json")
+            ? new Response("offline", { status: 503 })
+            : caches.match("./index.html").then((hit) => hit || caches.match("./"))
+        )
     );
     return;
   }
