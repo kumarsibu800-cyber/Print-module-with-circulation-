@@ -1,0 +1,22 @@
+{
+ "app": "library-circulation-admin",
+ "v": 1,
+ "saved": "2026-10-07T11:52:44.812583Z",
+ "admin": {
+  "id": "admin",
+  "email": "kumarsibu800@gmail.com",
+  "salt": "o7XeO1tOq1kNwfCFWIIVBw==",
+  "hash": "2HTshOvj15Xl6EdGhUkfBW7zhJbIfVV5NNsHtdbk6SE=",
+  "recSalt": "E9wANq0jY1KPhsw7FwF2jQ==",
+  "recHash": "A9QsnEQ8QsC6BudHTUtHAtL0wzPyoXlAqWYg89i/quo=",
+  "born": 1,
+  "created": "2026-10-07",
+  "lockAfter": 30,
+  "mail": {
+   "service": "",
+   "template": "",
+   "key": ""
+  },
+  "u": 1791373964731
+ }
+}
