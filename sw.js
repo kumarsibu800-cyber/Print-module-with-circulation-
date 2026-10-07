@@ -1,9 +1,16 @@
-// Change the version below whenever you upload a new index.html, so iPads fetch the update.
-const CACHE = "library-circulation-v14";
+// Library Circulation offline helper.
+// The app page itself always comes fresh from the internet when there is a connection,
+// and from the saved copy only when offline, so a new upload shows up on the next open.
+const CACHE = "library-circulation-v16";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png"];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // cache: "reload" skips the phone's short-term web cache, so the saved copy is the real latest one.
+  e.waitUntil(
+    caches.open(CACHE)
+      .then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: "reload" }))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener("activate", (e) => {
@@ -14,23 +21,46 @@ self.addEventListener("activate", (e) => {
   );
 });
 
+const isPage = (req) => {
+  if (req.mode === "navigate") return true;
+  const p = new URL(req.url).pathname;
+  return p.endsWith("/") || p.endsWith(".html");
+};
+
 self.addEventListener("fetch", (e) => {
-  if (e.request.method !== "GET") return;
-  // Never touch requests to other sites (the sync service), only this app's own files.
-  if (new URL(e.request.url).origin !== self.location.origin) return;
+  const req = e.request;
+  if (req.method !== "GET") return;
+  // Never touch requests to other sites (Google, jsonbin), only this app's own files.
+  if (new URL(req.url).origin !== self.location.origin) return;
+
+  if (isPage(req)) {
+    // Network first: newest app when online, saved copy when offline.
+    e.respondWith(
+      fetch(req.url, { cache: "no-cache" })
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put("./index.html", copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match("./index.html").then((hit) => hit || caches.match("./")))
+    );
+    return;
+  }
+
+  // Icons and the manifest: saved copy first, internet if missing.
   e.respondWith(
-    caches.match(e.request, { ignoreSearch: true }).then(
+    caches.match(req, { ignoreSearch: true }).then(
       (hit) =>
         hit ||
-        fetch(e.request)
-          .then((res) => {
-            if (res.ok && new URL(e.request.url).origin === self.location.origin) {
-              const copy = res.clone();
-              caches.open(CACHE).then((c) => c.put(e.request, copy));
-            }
-            return res;
-          })
-          .catch(() => caches.match("./index.html"))
+        fetch(req).then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return res;
+        })
     )
   );
 });

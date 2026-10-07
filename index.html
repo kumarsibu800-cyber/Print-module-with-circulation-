@@ -18,6 +18,18 @@
 <body>
 <div id="root"></div>
 <script>(function(){
+  if(!("serviceWorker" in navigator) || !/^https?:$/.test(location.protocol)) return;
+  var hadController = !!navigator.serviceWorker.controller, reloaded = false;
+  navigator.serviceWorker.addEventListener("controllerchange", function(){
+    // A newer version just took over: show it straight away, once.
+    if(hadController && !reloaded){ reloaded = true; location.reload(); }
+  });
+  navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(function(reg){
+    try { reg.update(); } catch(e) {}
+    document.addEventListener("visibilitychange", function(){ if(!document.hidden){ try { reg.update(); } catch(e) {} } });
+  }).catch(function(){});
+})();
+(function(){
   var KEYS=["circulation-desk:sync","circulation-desk:gtoken"];
   function show(msg){
     var root=document.getElementById("root");
@@ -17948,10 +17960,13 @@ function buildCatalogue(rows, fileName, sheetName) {
     }
     if (headerRow < 0)
         throw new Error("no-header");
+    if (map.code === undefined)
+        throw new Error("no-code-col");
     const cats = [];
     const catIndex = new Map();
     const raw = [];
     let skipped = 0;
+    let noCode = 0;
     const at = (r, k) => (map[k] === undefined ? "" : String(r[map[k]] || "").trim());
     for (let i = headerRow + 1; i < rows.length; i++) {
         const r = rows[i];
@@ -17975,8 +17990,12 @@ function buildCatalogue(rows, fileName, sheetName) {
         const call = at(r, "call") || [classNo, cutter].filter(Boolean).join(" ") || "—";
         const shelfRaw = at(r, "shelf");
         const shelf = Math.max(1, Math.round(Number(shelfRaw)) || 1);
-        const codeRaw = at(r, "code");
-        const code = codeRaw || String(raw.length + 1);
+        const codeRaw = at(r, "code").replace(/\.0+$/, "");
+        if (!codeRaw) {
+            noCode++;
+            continue;
+        }
+        const code = codeRaw;
         raw.push([raw.length + 1, /^\d+$/.test(code) ? Number(code) : code, title, at(r, "author") || "Unknown", catIndex.get(name), call, at(r, "shelfNo") || "—", shelf]);
     }
     if (!raw.length)
@@ -17985,6 +18004,7 @@ function buildCatalogue(rows, fileName, sheetName) {
         cats,
         raw,
         skipped,
+        noCode,
         sheet: sheetName,
         meta: { source: fileName, importedAt: todayISO(), sheet: sheetName },
     };
@@ -17995,7 +18015,8 @@ const CAT_ERRORS = {
     "not-xlsx": "That file isn't a readable Excel workbook. Save it as .xlsx (not .xls) or as CSV, then try again.",
     "no-sheet": "No sheets were found in that workbook.",
     "no-header": "No column headings were found. The sheet needs a row with Title, plus Author or Code, spelled as headings above the books.",
-    "no-rows": "No books were found under the headings. Check that the titles are in the column headed Title.",
+    "no-code-col": "No accession number column was found. Books are matched by accession number, so the sheet needs a column headed Code, Acc No or Accession No.",
+  "no-rows": "No books were found under the headings. Check that the titles are in the column headed Title.",
     "no-member-header": "No column headings were found. The sheet needs a row with Name, and ideally Class, Phone and ID, spelled as headings above the borrowers.",
     "no-member-rows": "No borrowers were found under the headings. Check that the names are in the column headed Name.",
 };
@@ -18109,15 +18130,22 @@ function mergeMembers(current, incoming, seq, today) {
     }
     return { members: out, added, updated, seq: next };
 }
+const accKey = (code) => String(code == null ? "" : code).trim().replace(/\.0+$/, "").toLowerCase();
 function mergeCatalogue(incoming) {
     const cats = CATALOGUE.cats.map((c) => ({ ...c }));
     const catIndex = new Map(cats.map((c, i) => [c.name.toLowerCase(), i]));
     const raw = CATALOGUE.raw.map((r) => [...r]);
-    const byKey = new Map(raw.map((r, i) => [`${r[1]}|${String(r[2]).toLowerCase()}`, i]));
-    const byTitleAuthor = new Map(raw.map((r, i) => [`${String(r[2]).toLowerCase()}|${String(r[3]).toLowerCase()}`, i]));
+    // accession number -> every catalogue row that has it
+    const byCode = new Map();
+    raw.forEach((r, i) => {
+        const k = accKey(r[1]);
+        if (!byCode.has(k)) byCode.set(k, []);
+        byCode.get(k).push(i);
+    });
     let nextSl = raw.reduce((m, r) => Math.max(m, r[0]), 0) + 1;
     let added = 0;
     let updated = 0;
+    const ambiguous = [];
     for (const row of incoming.raw) {
         const [, code, title, author, catIdx, call, shelfNo, shelf] = row;
         const inCat = incoming.cats[catIdx] || { name: "Uncategorised", emoji: "" };
@@ -18127,17 +18155,21 @@ function mergeCatalogue(incoming) {
             catIndex.set(inCat.name.toLowerCase(), ci);
             cats.push({ name: inCat.name, emoji: inCat.emoji });
         }
-        const key = `${code}|${String(title).toLowerCase()}`;
-        const at = byKey.has(key) ? byKey.get(key) : byTitleAuthor.get(`${String(title).toLowerCase()}|${String(author).toLowerCase()}`);
-        if (at !== undefined) {
-            const keep = raw[at][0];
-            raw[at] = [keep, code, title, author, ci, call, shelfNo, shelf];
+        const k = accKey(code);
+        const hits = byCode.get(k) || [];
+        if (hits.length > 1) {
+            // two books already share this accession number: don't guess which one is meant
+            if (!ambiguous.includes(String(code))) ambiguous.push(String(code));
+            continue;
+        }
+        if (hits.length === 1) {
+            const at = hits[0];
+            raw[at] = [raw[at][0], code, title, author, ci, call, shelfNo, shelf];
             updated++;
         }
         else {
             raw.push([nextSl, code, title, author, ci, call, shelfNo, shelf]);
-            byKey.set(key, raw.length - 1);
-            byTitleAuthor.set(`${String(title).toLowerCase()}|${String(author).toLowerCase()}`, raw.length - 1);
+            byCode.set(k, [raw.length - 1]);
             nextSl++;
             added++;
         }
@@ -18147,34 +18179,23 @@ function mergeCatalogue(incoming) {
         raw,
         added,
         updated,
+        ambiguous,
         meta: { source: incoming.meta.source, importedAt: todayISO(), sheet: incoming.meta.sheet, added: (CATALOGUE.meta.added || 0) + added },
     };
 }
 function matchLoans(loans, next) {
-    var _a;
-    const byBoth = new Map();
     const byCode = new Map();
     next.raw.forEach((r) => {
-        const [sl, code, title] = r;
-        byBoth.set(`${code}|${String(title).toLowerCase()}`, sl);
-        if (!byCode.has(String(code)))
-            byCode.set(String(code), sl);
+        const k = accKey(r[1]);
+        if (!byCode.has(k)) byCode.set(k, r[0]);
     });
     const moved = new Map();
-    let lost = 0;
     for (const l of loans) {
-        if (moved.has(l.sl))
-            continue;
+        if (moved.has(l.sl)) continue;
         const old = BOOK_BY_SL.get(l.sl);
-        if (!old) {
-            lost++;
-            continue;
-        }
-        const hit = (_a = byBoth.get(`${old.code}|${old.title.toLowerCase()}`)) !== null && _a !== void 0 ? _a : byCode.get(String(old.code));
-        if (hit === undefined)
-            lost++;
-        else
-            moved.set(l.sl, hit);
+        if (!old || old.gone) continue;
+        const hit = byCode.get(accKey(old.code));
+        if (hit !== undefined) moved.set(l.sl, hit);
     }
     return {
         loans: loans.filter((l) => moved.has(l.sl)).map((l) => ({ ...l, sl: moved.get(l.sl) })),
@@ -18209,10 +18230,13 @@ const missingInfo = (entry) => {
 };
 const plural = (n, w, many) => `${n} ${n === 1 ? w : many || w + "s"}`;
 const newId = () => "L" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-function searchBooks(q) {
+const isAccession = (t) => /^\d+$/.test(String(t).trim());
+function searchBooks(q, accessionOnly) {
     const t = q.trim().toLowerCase();
     if (!t)
         return BOOKS;
+    if (accessionOnly && isAccession(t))
+        return BOOKS.filter((b) => accKey(b.code) === accKey(t));
     const exact = [];
     const rest = [];
     for (const b of BOOKS) {
@@ -19012,12 +19036,14 @@ function BookForm({ ctx, sl }) {
     const set = (k) => (e) => { setErr(""); setF({ ...f, [k]: e.target.value }); };
     const onLoan = existing ? d.activeByBook.get(existing.sl) : null;
     const hasHistory = existing ? ctx.state.loans.some((l) => l.sl === existing.sl) : false;
-    const clash = BOOKS.find((b) => String(b.code) === f.code.trim() && (!existing || b.sl !== existing.sl));
+    const clash = f.code.trim() ? BOOKS.find((b) => accKey(b.code) === accKey(f.code) && (!existing || b.sl !== existing.sl)) : null;
     const save = () => {
         if (!f.title.trim())
             return setErr("Enter the book's title.");
         if (!f.code.trim())
             return setErr("Enter the accession number written in the book.");
+        if (clash)
+            return setErr(`Accession no. ${f.code.trim()} already belongs to \u201c${clash.title}\u201d. Each book needs its own number.`);
         const catName = (f.catName === "__new" ? f.newCat : f.catName).trim();
         if (!catName)
             return setErr("Name the category, or pick one from the list.");
@@ -19048,12 +19074,12 @@ function BookForm({ ctx, sl }) {
             React.createElement("label", { className: "field" },
                 React.createElement("span", null, "Call no."),
                 React.createElement("input", { className: "input", value: f.call, onChange: set("call"), placeholder: "823.914 ROW" }))),
-        clash && (React.createElement("p", { style: { fontSize: 13, color: "var(--brass)", margin: "6px 0 0" } },
+        clash && (React.createElement("p", { style: { fontSize: 13, color: "var(--stamp)", margin: "6px 0 0" } },
             "Accession no. ",
             f.code.trim(),
-            " is already on \u201C",
+            " already belongs to \u201C",
             clash.title,
-            "\u201D. Two books can share it, but it makes issuing harder.")),
+            "\u201D. Each book needs its own number.")),
         React.createElement("label", { className: "field" },
             React.createElement("span", null, "Category"),
             React.createElement("select", { className: "select", value: f.catName, onChange: set("catName") },
@@ -19377,10 +19403,15 @@ function StockFlow({ ctx }) {
         const t = raw.trim().toLowerCase();
         if (!t)
             return;
-        const hits = sum.books.filter((b) => String(b.code).toLowerCase() === t);
-        const book = hits[0] || sum.books.find((b) => b.hay.includes(t));
+        const hits = sum.books.filter((b) => accKey(b.code) === accKey(t));
+        const book = hits[0];
+        if (!book && !isAccession(t) && !BOOKS.some((b) => accKey(b.code) === accKey(t))) {
+            setFlash({ bad: true, text: "Type the accession number from the book. To find a book by its title, use the search box over the list." });
+            setCode("");
+            return;
+        }
         if (!book) {
-            const elsewhere = BOOKS.find((b) => String(b.code).toLowerCase() === t);
+            const elsewhere = BOOKS.find((b) => accKey(b.code) === accKey(t));
             actions.stockUnknown(raw.trim());
             setFlash({
                 bad: true,
@@ -19744,7 +19775,7 @@ function IssueFlow({ ctx, presetSl, presetMemberId }) {
     const badDate = !issued || issued > today;
     const canIssue = member && book && !atLimit && !bookLoan && !badDate;
     const memberResults = searchMembers(state.members, mq).slice(0, 8);
-    const bookResults = bq.trim() ? searchBooks(bq).slice(0, 15) : [];
+    const bookResults = bq.trim() ? searchBooks(bq, true).slice(0, 15) : [];
     return (React.createElement("div", null,
         React.createElement("div", { className: "step" }, "Borrower"),
         member ? (React.createElement(React.Fragment, null,
@@ -19964,7 +19995,9 @@ function ReturnFlow({ ctx, presetLoanId }) {
             return true;
         const b = BOOK_BY_SL.get(l.sl);
         const m = d.memberById.get(l.memberId);
-        return String(b.code) === t || b.hay.includes(t) || (m && `${m.name} ${m.id}`.toLowerCase().includes(t));
+        if (isAccession(t))
+            return accKey(b.code) === accKey(t);
+        return b.hay.includes(t) || (m && `${m.name} ${m.id}`.toLowerCase().includes(t));
     })
         .sort((a, b) => (a.due < b.due ? -1 : 1));
     return (React.createElement("div", null,
@@ -20431,7 +20464,7 @@ function SettingsForm({ ctx }) {
                 " ",
                 catBusy ? "Reading the file…" : "Add books from Excel or CSV"),
             CATALOGUE.meta.source !== "builtin" && (React.createElement("button", { className: "btn btn-ghost", onClick: () => setPendingCat(withCounts(BUILTIN, false)) }, "Back to built-in catalogue"))),
-        React.createElement("p", { style: { fontSize: 13, color: "var(--muted)", margin: "8px 0 0" } }, "New books are added to the ones already here. A book counts as already listed if its accession number and title match, or its title and author match, and its details are refreshed rather than duplicated. The sheet needs a heading row with Title, and ideally Author, Code, Category, Call No, Shelf No and Shelf (1-4)."),
+        React.createElement("p", { style: { fontSize: 13, color: "var(--muted)", margin: "8px 0 0" } }, "New books are added to the ones already here. Books are matched by accession number only: a row whose accession number is already in the catalogue updates that book, and any other row is added as new. The sheet needs a heading row with Title and Code (the accession number), and ideally Author, Category, Call No, Shelf No and Shelf (1-4). Rows without an accession number are left out."),
         pendingCat && (pendingCat.error ? (React.createElement("div", { className: "notice warn" },
             pendingCat.error,
             React.createElement("div", { className: "btn-row" },
@@ -20444,6 +20477,8 @@ function SettingsForm({ ctx }) {
             ".",
             pendingCat.skipped > 0 &&
                 ` ${plural(pendingCat.skipped, "row")} without a title ${pendingCat.skipped === 1 ? "was" : "were"} left out.`,
+            pendingCat.noCode > 0 &&
+                ` ${plural(pendingCat.noCode, "row")} without an accession number ${pendingCat.noCode === 1 ? "was" : "were"} left out, because books are matched by accession number.`,
             pendingCat.merged && (React.createElement(React.Fragment, null,
                 React.createElement("p", { style: { margin: "8px 0 0" } },
                     React.createElement("b", null, "Add to the catalogue:"),
@@ -20454,7 +20489,9 @@ function SettingsForm({ ctx }) {
                         `, ${plural(pendingCat.merged.updated, "book")} already listed ${pendingCat.merged.updated === 1 ? "has its details" : "have their details"} refreshed`,
                     ". The catalogue becomes ",
                     plural(pendingCat.merged.raw.length, "book"),
-                    ". Nothing is lost."),
+                    ". Nothing is lost.",
+                    pendingCat.merged.ambiguous && pendingCat.merged.ambiguous.length > 0 &&
+                        ` Not changed: accession no. ${pendingCat.merged.ambiguous.join(", ")}, because more than one book here already has that number. Fix those by hand first.`),
                 React.createElement("p", { style: { margin: "6px 0 0" } },
                     React.createElement("b", null, "Replace the catalogue:"),
                     " only these ",
@@ -21034,7 +21071,7 @@ class RescueBoundary extends React.Component {
 }
 ReactDOMClient.createRoot(document.getElementById("root")).render(React.createElement(RescueBoundary, null, React.createElement(App)));
 })();
-if("serviceWorker" in navigator && /^https?:$/.test(location.protocol)){window.addEventListener("load",function(){navigator.serviceWorker.register("sw.js").catch(function(){});});}
+
 </script>
 </body>
 </html>
