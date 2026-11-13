@@ -17261,7 +17261,8 @@ const DEFAULT_STATE = {
     missing: {},
     stockU: 0,
     settingsU: 0,
-    deleted: { members: [], loans: [] },
+    deleted: { members: [], loans: [], attendance: [] },
+    attendance: [],
     settings: {
         loanDays: 14,
         finePerDay: 2,
@@ -17677,8 +17678,71 @@ const jsonbinProvider = {
     push: (cfg, doc) => pushRemote(cfg, doc),
     create: (cfg, doc) => createRemote(cfg, doc),
 };
-const providerOf = (cfg) => (cfg && cfg.provider === "gdrive" ? gdriveProvider : jsonbinProvider);
-const syncHasCreds = (cfg) => !!(cfg && (cfg.provider === "gdrive" ? cfg.clientId : cfg.key));
+/* ---------- Supabase (PostgreSQL) as the online copy ---------- */
+const cleanSupabaseUrl = (t) => {
+    const m = String(t || "").trim().match(/^https:\/\/[a-z0-9-]+\.supabase\.(co|in)/i);
+    return m ? m[0].toLowerCase() : "";
+};
+const supabaseKeyKind = (k) => {
+    k = String(k || "").trim();
+    if (!k) return "";
+    if (/^sb_secret_/i.test(k)) return "secret";
+    if (/^sb_publishable_/i.test(k)) return "publishable";
+    if (/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(k)) {
+        try {
+            const body = JSON.parse(atob(k.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+            return body.role === "service_role" ? "secret" : "anon";
+        }
+        catch (e) {
+            return "anon";
+        }
+    }
+    return "bad";
+};
+function newLibraryCode() {
+    const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const bytes = new Uint8Array(20);
+    crypto.getRandomValues(bytes);
+    const chars = Array.from(bytes, (b) => abc[b % abc.length]).join("");
+    return `LIB-${chars.slice(0, 5)}-${chars.slice(5, 10)}-${chars.slice(10, 15)}-${chars.slice(15, 20)}`;
+}
+async function sbRpc(cfg, fn, body) {
+    const headers = { "Content-Type": "application/json", apikey: cfg.key };
+    if (/^eyJ/.test(cfg.key))
+        headers.Authorization = `Bearer ${cfg.key}`;
+    let res;
+    try {
+        res = await fetch(`${cfg.url}/rest/v1/rpc/${fn}`, { method: "POST", headers, body: JSON.stringify(body) });
+    }
+    catch (e) {
+        throw Object.assign(new Error("sbnet"), { status: "sbnet" });
+    }
+    if (!res.ok) {
+        let code = "";
+        try {
+            code = (await res.json()).code || "";
+        }
+        catch (e) {
+            /* ignore */
+        }
+        const st = res.status === 401 || res.status === 403 ? "sb401" : res.status === 404 || code === "PGRST202" || code === "42883" || code === "42P01" ? "sbsql" : "sb" + res.status;
+        throw Object.assign(new Error(st), { status: st });
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+}
+const supabaseProvider = {
+    locate: async () => null,
+    pull: (cfg) => sbRpc(cfg, "lc_get", { p_code: cfg.bin }),
+    push: (cfg, doc) => sbRpc(cfg, "lc_put", { p_code: cfg.bin, p_doc: doc }),
+    create: async (cfg, doc) => {
+        const code = newLibraryCode();
+        await sbRpc(cfg, "lc_put", { p_code: code, p_doc: doc });
+        return code;
+    },
+};
+const providerOf = (cfg) => (cfg && cfg.provider === "gdrive" ? gdriveProvider : cfg && cfg.provider === "supabase" ? supabaseProvider : jsonbinProvider);
+const syncHasCreds = (cfg) => !!(cfg && (cfg.provider === "gdrive" ? cfg.clientId : cfg.provider === "supabase" ? cfg.url && cfg.key : cfg.key));
 const syncReady = (cfg) => syncHasCreds(cfg) && !!cfg.bin;
 Object.assign(SYNC_ERRORS, {
     auth: "Google needs you to sign in again (sign-ins last about an hour).",
@@ -17689,6 +17753,12 @@ Object.assign(SYNC_ERRORS, {
     g400: "Google rejected the request. Check the Client ID was copied in full.",
     g403: "Google refused access. Check the Google Drive API is turned on in your Google Cloud project.",
     g404: "The library file in Google Drive can't be found. It may have been deleted; tap Connect to start a new one.",
+    sbnet: "Couldn't reach Supabase. Check the internet connection and the Project URL. A free project that wasn't used for a week is paused: open supabase.com and tap Restore project.",
+    sb401: "Supabase didn't accept that key. Copy the publishable (or anon public) key again from Project Settings, API Keys.",
+    sbsql: "The library table isn't set up in Supabase yet. Run the setup SQL from the guide in the SQL Editor, then try again.",
+    sb400: "Supabase rejected the request. Check the setup SQL ran without errors.",
+    sb500: "Supabase had a problem saving. Try again in a minute.",
+    sbnocode: "No library was found for that code in this Supabase project. Check the code and the Project URL.",
 });
 const AUTH_ERRORS = ["auth", "denied", "closed", "popup"];
 const docBody = (d) => {
@@ -17704,6 +17774,7 @@ function toDoc(state, catalogue) {
         members: state.members,
         loans: state.loans,
         deleted: state.deleted || { members: [], loans: [] },
+        attendance: state.attendance || [],
         notified: state.notified || {},
         notifiedU: state.notifiedU || 0,
         stock: state.stock || null,
@@ -17753,6 +17824,7 @@ function mergeStates(local, remote, catalogue) {
     const deleted = {
         members: mergeTombs(local.deleted && local.deleted.members, remote.deleted && remote.deleted.members),
         loans: mergeTombs(local.deleted && local.deleted.loans, remote.deleted && remote.deleted.loans),
+        attendance: mergeTombs(local.deleted && local.deleted.attendance, remote.deleted && remote.deleted.attendance),
     };
     const theirSettingsNewer = (remote.settingsU || 0) > (local.settingsU || 0);
     const theirCatNewer = (remote.catalogueU || 0) > ((catalogue.meta && catalogue.meta.u) || 0);
@@ -17763,6 +17835,7 @@ function mergeStates(local, remote, catalogue) {
         ...local,
         members: mergeLists(local.members, remote.members, deleted.members),
         loans: mergeLists(local.loans, remote.loans, deleted.loans),
+        attendance: mergeLists(local.attendance, remote.attendance, deleted.attendance),
         deleted,
         seq: Math.max(local.seq || 1, remote.seq || 1),
         notified: theirNotifiedNewer ? remote.notified || {} : local.notified || {},
@@ -18288,7 +18361,7 @@ font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',syst
 .cloud-dot.off{background:#BFC9C3}
 .cm-main{max-width:760px;margin:0 auto;padding:18px 16px 104px}
 .cm-nav{position:fixed;bottom:0;left:0;right:0;z-index:20;background:var(--surface);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
-.cm-nav-in{max-width:760px;margin:0 auto;display:grid;grid-template-columns:repeat(5,1fr)}
+.cm-nav-in{max-width:760px;margin:0 auto;display:grid;grid-template-columns:repeat(6,1fr)}
 .cm-nav button{background:none;border:0;padding:9px 2px 10px;display:flex;flex-direction:column;align-items:center;gap:3px;font-size:11.5px;font-weight:600;color:var(--muted);position:relative;text-align:center;line-height:1.2}
 .cm-nav button[aria-current="page"]{color:var(--ink)}
 .cm-nav button[aria-current="page"]::before{content:"";position:absolute;top:0;left:28%;right:28%;height:3px;border-radius:0 0 3px 3px;background:var(--ink)}
@@ -18301,6 +18374,12 @@ font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',syst
 .ledger div+div{border-left:1px solid var(--line)}
 .ledger div:first-child{border-radius:11px 0 0 11px}
 .ledger div:last-child{border-radius:0 11px 11px 0}
+.att-ledger b{font-size:19px !important}
+.att-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.att-date{flex:1 1 140px;min-width:0;max-width:240px}
+.att-date .input{width:100%;min-width:0}
+.att-btn{min-height:40px;padding:0 14px;flex-shrink:0}
+.cm .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 .ledger b{display:block;font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.2}
 .ledger span{font-size:13px;color:var(--muted)}
 .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
@@ -20277,6 +20356,7 @@ function MemberDetail({ ctx, memberId }) {
         React.createElement("div", { className: "list" },
             onLoan.length === 0 && React.createElement("div", { className: "empty" }, "No books out."),
             onLoan.map((l) => (React.createElement(LoanRow, { key: l.id, loan: l, ctx: ctx, showMember: false, onClick: () => open("return", { loanId: l.id }) })))),
+        React.createElement(MemberAttendance, { ctx: ctx, memberId: m.id }),
         React.createElement("h2", { className: "sec" },
             "Borrowing history ",
             React.createElement("small", null, past.length ? plural(past.length, "book") : "")),
@@ -20311,6 +20391,8 @@ function SyncPanel({ ctx }) {
     const [key, setKey] = useState("");
     const [code, setCode] = useState("");
     const [clientId, setClientId] = useState("");
+    const [sbUrl, setSbUrl] = useState("");
+    const [sbErr, setSbErr] = useState("");
     const [busy, setBusy] = useState(false);
     const [copied, setCopied] = useState("");
     const origin = typeof location !== "undefined" ? location.origin : "";
@@ -20326,6 +20408,26 @@ function SyncPanel({ ctx }) {
         try {
             if (provider === "gdrive")
                 await connectSync({ provider: "gdrive", clientId: cleanClientId(clientId) });
+            else if (provider === "supabase") {
+                setSbErr("");
+                const cfg = { provider: "supabase", url: cleanSupabaseUrl(sbUrl), key: key.trim() };
+                const joinCode = code.trim().toUpperCase();
+                try {
+                    if (joinCode) {
+                        const found = await sbRpc(cfg, "lc_get", { p_code: joinCode });
+                        if (!found)
+                            throw Object.assign(new Error("sbnocode"), { status: "sbnocode" });
+                    }
+                    else
+                        await sbRpc(cfg, "lc_get", { p_code: "LIB-CHECK" });
+                }
+                catch (e) {
+                    setSbErr(SYNC_ERRORS[e.status] || "Couldn't connect to Supabase.");
+                    throw e;
+                }
+                await connectSync({ ...cfg, bin: joinCode || newLibraryCode() });
+                setSbUrl("");
+            }
             else
                 await connectSync({ provider: "jsonbin", key: key.trim(), bin: code.trim() });
             setKey("");
@@ -20339,9 +20441,10 @@ function SyncPanel({ ctx }) {
     };
     if (syncReady(sync)) {
         const google = sync.provider === "gdrive";
+        const supa = sync.provider === "supabase";
         return (React.createElement("div", null,
             React.createElement("p", { style: { fontSize: 14, color: "var(--muted)", margin: "0 0 10px" } },
-                google ? "Saving to your Google Drive." : "Saving to jsonbin.io.",
+                google ? "Saving to your Google Drive." : supa ? "Saving to your Supabase database (PostgreSQL)." : "Saving to jsonbin.io.",
                 " ",
                 syncState.busy
                     ? "Syncing now…"
@@ -20356,7 +20459,7 @@ function SyncPanel({ ctx }) {
                 React.createElement("div", null,
                     React.createElement("dt", null, "Other devices"),
                     React.createElement("dd", null, "Same Client ID, tap Connect")))) : (React.createElement("label", { className: "field", style: { marginTop: 0 } },
-                React.createElement("span", null, "Library code for your other device"),
+                React.createElement("span", null, supa ? "Library code (enter it on your other devices with the same Project URL and key)" : "Library code for your other device"),
                 React.createElement("input", { className: "input", value: sync.bin, readOnly: true, onFocus: (e) => e.target.select() }))),
             React.createElement("div", { className: "btn-row" },
                 google && syncState.authNeeded ? (React.createElement("button", { className: "btn btn-primary", onClick: googleSignIn }, "Sign in to Google")) : (React.createElement("button", { className: "btn btn-primary", disabled: syncState.busy, onClick: syncNow }, syncState.busy ? "Syncing…" : "Sync now")),
@@ -20371,8 +20474,24 @@ function SyncPanel({ ctx }) {
     return (React.createElement("div", null,
         React.createElement("div", { className: "seg" },
             React.createElement("button", { "aria-pressed": provider === "gdrive", onClick: () => setProvider("gdrive") }, "Google Drive"),
+            React.createElement("button", { "aria-pressed": provider === "supabase", onClick: () => setProvider("supabase") }, "Supabase"),
             React.createElement("button", { "aria-pressed": provider === "jsonbin", onClick: () => setProvider("jsonbin") }, "jsonbin.io")),
-        provider === "gdrive" ? (React.createElement(React.Fragment, null,
+        provider === "supabase" ? (React.createElement(React.Fragment, null,
+            React.createElement("p", { style: { fontSize: 14, color: "var(--muted)", margin: "0 0 10px" } }, "Keeps the library in your own Supabase project, a PostgreSQL database with a free plan. Run the setup SQL from the guide once, then paste the Project URL and the publishable key from Project Settings, API Keys."),
+            React.createElement("label", { className: "field", style: { marginTop: 0 } },
+                React.createElement("span", null, "Project URL"),
+                React.createElement("input", { className: "input", value: sbUrl, autoCapitalize: "none", autoCorrect: "off", spellCheck: false, placeholder: "https://abcdefgh.supabase.co", onChange: (e) => { setSbUrl(e.target.value); setSbErr(""); } }),
+                sbUrl.trim() && !cleanSupabaseUrl(sbUrl) && React.createElement("em", { style: { color: "var(--stamp)" } }, "It should look like https://abcdefgh.supabase.co")),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Publishable key (or anon public key)"),
+                React.createElement("input", { className: "input", value: key, autoCapitalize: "none", autoCorrect: "off", spellCheck: false, placeholder: "sb_publishable_\u2026 or eyJ\u2026", onChange: (e) => { setKey(e.target.value); setSbErr(""); } }),
+                supabaseKeyKind(key) === "secret" && React.createElement("em", { style: { color: "var(--stamp)" } }, "That's the secret (service role) key. Never put it in the app; use the publishable or anon public key."),
+                supabaseKeyKind(key) === "bad" && React.createElement("em", { style: { color: "var(--stamp)" } }, "This doesn't look like a Supabase key. It starts with sb_publishable_ or eyJ.")),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Library code (only on your second device)"),
+                React.createElement("input", { className: "input", value: code, autoCapitalize: "characters", autoCorrect: "off", onChange: (e) => setCode(e.target.value), placeholder: "Leave empty on the first device" })),
+            (sbErr || syncState.error) && React.createElement("div", { className: "notice warn" }, sbErr || syncState.error),
+            React.createElement("button", { className: "btn btn-primary btn-block", style: { marginTop: 14 }, disabled: busy || !cleanSupabaseUrl(sbUrl) || !["publishable", "anon"].includes(supabaseKeyKind(key)), onClick: connect }, busy ? "Connecting\u2026" : code.trim() ? "Join this library" : "Start syncing"))) : provider === "gdrive" ? (React.createElement(React.Fragment, null,
             React.createElement("p", { style: { fontSize: 14, color: "var(--muted)", margin: "0 0 10px" } },
                 "Keeps one file, ",
                 GDRIVE_FILE,
@@ -20669,15 +20788,413 @@ function SettingsForm({ ctx }) {
         React.createElement("button", { className: "btn btn-danger btn-block", onClick: async () => {
                 if (!confirmReset)
                     return setConfirmReset(true);
-                if (!(await ctx.requirePassword("erase all borrowers and loans")))
+                if (!(await ctx.requirePassword("erase all borrowers, loans and attendance")))
                     return setConfirmReset(false);
                 actions.resetAll();
                 close();
             } },
             React.createElement(Trash2, { size: 16 }),
             " ",
-            confirmReset ? "Tap again to erase everything" : "Erase all borrowers and loans")));
+            confirmReset ? "Tap again to erase everything" : "Erase all borrowers, loans and attendance")));
 }
+/* ---------- daily attendance and hours of study ---------- */
+const CalendarCheck = mkIcon('<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="m9 16 2 2 4-4"/>');
+const nowHM = () => {
+    const d = new Date();
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+const hmMin = (t) => {
+    const m = /^(\d{1,2}):(\d{2})/.exec(String(t || ""));
+    return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+};
+const fmtTime = (t) => {
+    const m = hmMin(t);
+    if (m === null)
+        return "";
+    const h = Math.floor(m / 60);
+    return `${((h + 11) % 12) + 1}:${pad(m % 60)} ${h < 12 ? "am" : "pm"}`;
+};
+const fmtHM = (mins) => {
+    mins = Math.max(0, Math.round(mins || 0));
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return h ? `${h} h ${pad(m)} m` : `${m} m`;
+};
+const hoursDec = (mins) => (Math.round((mins / 60) * 100) / 100).toFixed(2);
+// minutes for one visit; an open visit counts up to now only on today's date
+function visitMinutes(e, today, nowMin) {
+    const a = hmMin(e.in);
+    if (a === null)
+        return 0;
+    let b = hmMin(e.out);
+    if (b === null)
+        b = e.date === today ? nowMin : null;
+    return b === null ? 0 : Math.max(0, b - a);
+}
+const isOpenVisit = (e) => !e.out;
+const personKind = (type) => (type === "Staff" ? "Staff" : type === "Student" ? "Student" : "Other");
+const attendList = (state) => state.attendance || [];
+const firstOfMonth = (iso) => iso.slice(0, 8) + "01";
+const lastMonthRange = (iso) => {
+    const first = firstOfMonth(iso);
+    const end = addDays(first, -1);
+    return [firstOfMonth(end), end];
+};
+function attendanceSummary(entries, from, to, kind, today, nowMin) {
+    const people = new Map();
+    for (const e of entries) {
+        if (e.date < from || e.date > to)
+            continue;
+        if (kind !== "all" && personKind(e.type) !== kind)
+            continue;
+        let p = people.get(e.pid);
+        if (!p) {
+            p = { pid: e.pid, name: e.name, type: e.type, group: e.group, days: new Set(), mins: 0, visits: 0, open: 0 };
+            people.set(e.pid, p);
+        }
+        p.days.add(e.date);
+        p.visits++;
+        p.mins += visitMinutes(e, today, nowMin);
+        if (!e.out && e.date !== today)
+            p.open++;
+    }
+    return [...people.values()]
+        .map((p) => ({ ...p, days: p.days.size }))
+        .sort((a, b) => b.mins - a.mins || a.name.localeCompare(b.name));
+}
+function attendanceCsv(entries, from, to, kind, today, nowMin) {
+    const esc = (v) => {
+        const t = String(v == null ? "" : v);
+        return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
+    const sum = attendanceSummary(entries, from, to, kind, today, nowMin);
+    const lines = [];
+    lines.push(["Library attendance", `${from} to ${to}`, kind === "all" ? "Students and staff" : kind]);
+    lines.push([]);
+    lines.push(["SUMMARY"]);
+    lines.push(["ID", "Name", "Type", "Class or department", "Days present", "Visits", "Hours of study", "Hours (decimal)", "Average hours per day"]);
+    for (const p of sum)
+        lines.push([p.pid, p.name, p.type, p.group || "", p.days, p.visits, fmtHM(p.mins), hoursDec(p.mins), hoursDec(p.days ? p.mins / p.days : 0)]);
+    lines.push([]);
+    lines.push(["DAILY REGISTER"]);
+    lines.push(["Date", "ID", "Name", "Type", "Class or department", "Time in", "Time out", "Hours of study", "Hours (decimal)"]);
+    const rows = entries
+        .filter((e) => e.date >= from && e.date <= to && (kind === "all" || personKind(e.type) === kind))
+        .sort((a, b) => (a.date + a.in < b.date + b.in ? -1 : 1));
+    for (const e of rows) {
+        const m = visitMinutes(e, today, nowMin);
+        lines.push([e.date, e.pid, e.name, e.type, e.group || "", fmtTime(e.in), e.out ? fmtTime(e.out) : e.date === today ? "Still in" : "Not marked", fmtHM(m), hoursDec(m)]);
+    }
+    return "﻿" + lines.map((r) => r.map(esc).join(",")).join("\r\n");
+}
+const PRINT_ATT = {
+    day(date, entries, ctx, nowMin) {
+        const list = entries.filter((e) => e.date === date).sort((a, b) => (a.in < b.in ? -1 : 1));
+        const people = new Set(list.map((e) => e.pid));
+        const st = new Set(list.filter((e) => personKind(e.type) === "Student").map((e) => e.pid)).size;
+        const sf = new Set(list.filter((e) => personKind(e.type) === "Staff").map((e) => e.pid)).size;
+        const total = list.reduce((n, e) => n + visitMinutes(e, ctx.today, nowMin), 0);
+        const rows = list.map((e, i) => [
+            i + 1, e.pid, e.name, e.group || e.type, fmtTime(e.in),
+            e.out ? fmtTime(e.out) : e.date === ctx.today ? "Still in" : "Not marked",
+            fmtHM(visitMinutes(e, ctx.today, nowMin)), "",
+        ]);
+        printHtml(`Attendance register, ${fmtDate(date)}`, prFacts([["Date", fmtLong(date)], ["Present", `${people.size} (${st} students, ${sf} staff)`], ["Total hours of study", fmtHM(total)]]) +
+            prTable(["No.", "ID", "Name", "Class / dept.", "In", "Out", "Hours", "Signature"], rows, ["5%", "9%", "22%", "15%", "10%", "10%", "11%", "18%"]), ctx.s);
+    },
+    report(sum, from, to, kind, ctx) {
+        const total = sum.reduce((n, p) => n + p.mins, 0);
+        const rows = sum.map((p, i) => [i + 1, p.pid, p.name, p.group || p.type, p.days, fmtHM(p.mins), fmtHM(p.days ? p.mins / p.days : 0)]);
+        printHtml("Attendance and hours of study", prFacts([
+            ["Period", `${fmtDate(from)} to ${fmtDate(to)}`],
+            ["Showing", kind === "all" ? "Students and staff" : kind === "Staff" ? "Staff" : "Students"],
+            ["People", String(sum.length)],
+            ["Total hours of study", fmtHM(total)],
+        ]) + prTable(["No.", "ID", "Name", "Class / dept.", "Days", "Hours of study", "Avg per day"], rows, ["6%", "10%", "28%", "18%", "8%", "15%", "15%"]), ctx.s);
+    },
+};
+function KindSeg({ kind, setKind }) {
+    return (React.createElement("div", { className: "seg" },
+        React.createElement("button", { "aria-pressed": kind === "all", onClick: () => setKind("all") }, "Everyone"),
+        React.createElement("button", { "aria-pressed": kind === "Student", onClick: () => setKind("Student") }, "Students"),
+        React.createElement("button", { "aria-pressed": kind === "Staff", onClick: () => setKind("Staff") }, "Staff")));
+}
+function AttendanceView({ ctx }) {
+    const { state, today, actions, open } = ctx;
+    const [view, setView] = useState("day");
+    const [date, setDate] = useState(today);
+    const [q, setQ] = useState("");
+    const [kind, setKind] = useState("all");
+    const [from, setFrom] = useState(firstOfMonth(today));
+    const [to, setTo] = useState(today);
+    const [, setTick] = useState(0);
+    const [allOut, setAllOut] = useState(false);
+    useEffect(() => {
+        const t = setInterval(() => setTick((n) => n + 1), 30000);
+        return () => clearInterval(t);
+    }, []);
+    const nowMin = hmMin(nowHM());
+    const all = attendList(state);
+    const isToday = date === today;
+    const dayList = all.filter((e) => e.date === date).sort((a, b) => (a.in < b.in ? 1 : -1));
+    const shown = dayList.filter((e) => kind === "all" || personKind(e.type) === kind);
+    const openNow = isToday ? dayList.filter(isOpenVisit) : [];
+    const openBy = new Map(openNow.map((e) => [e.pid, e]));
+    const present = new Set(shown.map((e) => e.pid)).size;
+    const dayMins = shown.reduce((n, e) => n + visitMinutes(e, today, nowMin), 0);
+    const people = state.members.filter((m) => kind === "all" || personKind(m.type) === kind);
+    const found = q.trim() ? searchMembers(people, q).slice(0, 8) : [];
+    const markIn = (m) => {
+        if (isToday)
+            actions.attendIn(m, today, nowHM());
+        else
+            open("attend", { pid: m.id, date });
+        setQ("");
+    };
+    if (view === "report") {
+        const sum = attendanceSummary(all, from, to, kind, today, nowMin);
+        const total = sum.reduce((n, p) => n + p.mins, 0);
+        const unmarked = sum.reduce((n, p) => n + p.open, 0);
+        const lm = lastMonthRange(today);
+        return (React.createElement(React.Fragment, null,
+            React.createElement("div", { className: "seg" },
+                React.createElement("button", { "aria-pressed": false, onClick: () => setView("day") }, "Daily register"),
+                React.createElement("button", { "aria-pressed": true }, "Hours report")),
+            React.createElement("div", { className: "grid2" },
+                React.createElement("label", { className: "field", style: { marginTop: 0 } },
+                    React.createElement("span", null, "From"),
+                    React.createElement("input", { className: "input", type: "date", value: from, max: to, onChange: (e) => e.target.value && setFrom(e.target.value) })),
+                React.createElement("label", { className: "field", style: { marginTop: 0 } },
+                    React.createElement("span", null, "To"),
+                    React.createElement("input", { className: "input", type: "date", value: to, min: from, onChange: (e) => e.target.value && setTo(e.target.value) }))),
+            React.createElement("div", { className: "chips" },
+                React.createElement("button", { className: "chip chip-all", onClick: () => { setFrom(addDays(today, -6)); setTo(today); } }, "Last 7 days"),
+                React.createElement("button", { className: "chip chip-all", onClick: () => { setFrom(firstOfMonth(today)); setTo(today); } }, "This month"),
+                React.createElement("button", { className: "chip chip-all", onClick: () => { setFrom(lm[0]); setTo(lm[1]); } }, "Last month"),
+                React.createElement("button", { className: "chip chip-all", onClick: () => { setFrom(today.slice(0, 4) + "-01-01"); setTo(today); } }, "This year")),
+            React.createElement(KindSeg, { kind: kind, setKind: setKind }),
+            React.createElement("div", { className: "ledger att-ledger" },
+                React.createElement("div", { style: { "--lt": "#E0EFF8" } },
+                    React.createElement("b", { style: { color: "#155F8C" } }, sum.length),
+                    React.createElement("span", null, "People")),
+                React.createElement("div", { style: { "--lt": "var(--okBg)" } },
+                    React.createElement("b", { style: { color: "var(--ink)" } }, fmtHM(total)),
+                    React.createElement("span", null, "Hours of study")),
+                React.createElement("div", { style: { "--lt": "var(--brassBg)" } },
+                    React.createElement("b", { style: { color: "var(--brass)" } }, fmtHM(sum.length ? total / sum.length : 0)),
+                    React.createElement("span", null, "Average each"))),
+            unmarked > 0 && (React.createElement("div", { className: "notice caution" },
+                plural(unmarked, "visit"),
+                " in this period ",
+                unmarked === 1 ? "has" : "have",
+                " no time out, so ",
+                unmarked === 1 ? "it counts" : "they count",
+                " as 0 hours. Open that day's register and tap the entry to add the time out.")),
+            React.createElement("div", { className: "pr-tools", style: { marginTop: 12 } },
+                React.createElement("button", { className: "btn btn-ghost", disabled: !sum.length, onClick: () => shareOrDownload(`attendance-${from}-to-${to}.csv`, attendanceCsv(all, from, to, kind, today, nowMin), "text/csv") },
+                    React.createElement(Download, { size: 18 }),
+                    " Excel"),
+                React.createElement(PrintButton, { label: "Print report", onClick: () => PRINT_ATT.report(sum, from, to, kind, ctx) })),
+            React.createElement("div", { className: "list" },
+                sum.length === 0 && React.createElement("div", { className: "empty" }, "No attendance in this period."),
+                sum.map((p) => (React.createElement("button", { key: p.pid, className: "row", onClick: () => open("member", { memberId: p.pid }) },
+                    React.createElement("div", { className: "avatar", style: catStyle(hashOf(p.pid + p.name) % PALETTE.length), "aria-hidden": "true" }, initialsOf(p.name)),
+                    React.createElement("div", { className: "row-main" },
+                        React.createElement("div", { className: "row-title" }, p.name),
+                        React.createElement("div", { className: "row-sub" },
+                            p.pid,
+                            " / ",
+                            p.group || p.type,
+                            " / ",
+                            plural(p.days, "day"))),
+                    React.createElement("div", { className: "row-end" },
+                        React.createElement("span", { className: "pill pill-ok" }, fmtHM(p.mins)),
+                        React.createElement("span", { className: "row-sub" },
+                            fmtHM(p.days ? p.mins / p.days : 0),
+                            " a day"))))))));
+    }
+    return (React.createElement(React.Fragment, null,
+        React.createElement("div", { className: "seg" },
+            React.createElement("button", { "aria-pressed": true }, "Daily register"),
+            React.createElement("button", { "aria-pressed": false, onClick: () => setView("report") }, "Hours report")),
+        React.createElement("div", { className: "att-bar" },
+            React.createElement("label", { className: "att-date" },
+                React.createElement("span", { className: "sr" }, "Date"),
+                React.createElement("input", { className: "input", type: "date", value: date, max: today, onChange: (e) => e.target.value && setDate(e.target.value) })),
+            !isToday && React.createElement("button", { className: "btn btn-ghost", onClick: () => setDate(today) }, "Today"),
+            React.createElement(PrintButton, { label: "Print", onClick: () => PRINT_ATT.day(date, all, ctx, nowMin) })),
+        React.createElement(KindSeg, { kind: kind, setKind: setKind }),
+        React.createElement("div", { className: "ledger att-ledger" },
+            React.createElement("div", { style: { "--lt": "#E0EFF8" } },
+                React.createElement("b", { style: { color: "#155F8C" } }, present),
+                React.createElement("span", null, "Present")),
+            React.createElement("div", { style: { "--lt": "var(--okBg)" } },
+                React.createElement("b", { style: { color: "var(--ink)" } }, isToday ? openNow.filter((e) => kind === "all" || personKind(e.type) === kind).length : "—"),
+                React.createElement("span", null, "In library now")),
+            React.createElement("div", { style: { "--lt": "var(--brassBg)" } },
+                React.createElement("b", { style: { color: "var(--brass)" } }, fmtHM(dayMins)),
+                React.createElement("span", null, "Hours of study"))),
+        React.createElement("h2", { className: "sec" }, isToday ? "Mark in or out" : `Add attendance for ${fmtDate(date)}`),
+        React.createElement(Search, { value: q, onChange: setQ, placeholder: "Name, ID or class of student or staff" }),
+        q.trim() !== "" && (React.createElement("div", { className: "list", style: { marginTop: 8 } },
+            found.length === 0 && (React.createElement("div", { className: "empty" },
+                "Nobody matches \"",
+                q,
+                "\". Students and staff are taken from Borrowers.",
+                " ",
+                React.createElement("button", { className: "btn btn-ghost", style: { marginLeft: 6 }, onClick: () => open("memberForm") },
+                    React.createElement(Plus, { size: 16 }),
+                    " Add person"))),
+            found.map((m) => {
+                const inNow = openBy.get(m.id);
+                return (React.createElement("div", { key: m.id, className: "row" },
+                    React.createElement("div", { className: "avatar", style: catStyle(hashOf(m.id + m.name) % PALETTE.length), "aria-hidden": "true" }, initialsOf(m.name)),
+                    React.createElement("div", { className: "row-main" },
+                        React.createElement("div", { className: "row-title" }, m.name),
+                        React.createElement("div", { className: "row-sub" },
+                            m.id,
+                            " / ",
+                            m.group || m.type,
+                            inNow ? ` / in since ${fmtTime(inNow.in)}` : "")),
+                    inNow ? (React.createElement("button", { className: "btn btn-blue att-btn", onClick: () => { actions.attendOut(inNow.id, nowHM()); setQ(""); } }, "Mark out")) : (React.createElement("button", { className: "btn btn-primary att-btn", onClick: () => markIn(m) }, isToday ? "Mark in" : "Add"))));
+            }))),
+        isToday && openNow.length > 0 && (React.createElement(React.Fragment, null,
+            React.createElement("h2", { className: "sec" },
+                "In the library now ",
+                React.createElement("span", { className: "count", style: { margin: 0 } }, openNow.length)),
+            React.createElement("div", { className: "list" }, openNow.map((e) => (React.createElement("div", { key: e.id, className: "row" },
+                React.createElement("div", { className: "row-main" },
+                    React.createElement("div", { className: "row-title" }, e.name),
+                    React.createElement("div", { className: "row-sub" },
+                        e.group || e.type,
+                        " / in at ",
+                        fmtTime(e.in),
+                        " / ",
+                        fmtHM(visitMinutes(e, today, nowMin)),
+                        " so far")),
+                React.createElement("button", { className: "btn btn-blue att-btn", onClick: () => actions.attendOut(e.id, nowHM()) }, "Mark out"))))),
+            openNow.length > 1 && (React.createElement("button", { className: "btn btn-ghost btn-block", style: { marginTop: 10 }, onClick: () => {
+                    if (!allOut)
+                        return setAllOut(true);
+                    actions.attendAllOut(today, nowHM());
+                    setAllOut(false);
+                } }, allOut ? `Tap again to mark all ${openNow.length} out at ${fmtTime(nowHM())}` : "Mark everyone out (closing time)")))),
+        React.createElement("h2", { className: "sec" },
+            "Register for ",
+            isToday ? "today" : fmtDate(date),
+            " ",
+            React.createElement("span", { className: "count", style: { margin: 0 } }, plural(shown.length, "entry", "entries"))),
+        React.createElement("div", { className: "list" },
+            shown.length === 0 && (React.createElement("div", { className: "empty" }, isToday ? "Nobody marked in yet today. Search for a student or staff member above." : "No attendance on this day.")),
+            shown.map((e) => {
+                const mins = visitMinutes(e, today, nowMin);
+                return (React.createElement("button", { key: e.id, className: "row", onClick: () => open("attend", { entryId: e.id }) },
+                    React.createElement("div", { className: "row-main" },
+                        React.createElement("div", { className: "row-title" }, e.name),
+                        React.createElement("div", { className: "row-sub" },
+                            e.pid,
+                            " / ",
+                            e.group || e.type,
+                            " / ",
+                            fmtTime(e.in),
+                            " to ",
+                            e.out ? fmtTime(e.out) : e.date === today ? "now" : "?")),
+                    React.createElement("div", { className: "row-end" },
+                        !e.out && e.date !== today ? (React.createElement("span", { className: "pill pill-late" }, "Out not marked")) : (React.createElement("span", { className: `pill ${e.out ? "pill-ok" : "pill-out"}` }, fmtHM(mins))),
+                        React.createElement("span", { className: "row-sub" }, personKind(e.type)))));
+            }))));
+}
+function AttendanceForm({ ctx, entryId, pid, date: presetDate }) {
+    const { state, actions, close, today } = ctx;
+    const entry = entryId ? attendList(state).find((e) => e.id === entryId) : null;
+    const person = entry ? null : state.members.find((m) => m.id === pid);
+    const [date, setDate] = useState(entry ? entry.date : presetDate || today);
+    const [tin, setTin] = useState(entry ? entry.in : "10:00");
+    const [tout, setTout] = useState(entry ? entry.out || "" : "");
+    const [err, setErr] = useState("");
+    const [confirmDel, setConfirmDel] = useState(false);
+    if (!entry && !person)
+        return React.createElement("div", { className: "empty" }, "This entry no longer exists.");
+    const who = entry || { name: person.name, pid: person.id, group: person.group, type: person.type };
+    const save = () => {
+        const a = hmMin(tin);
+        const b = hmMin(tout);
+        if (a === null)
+            return setErr("Enter the time in.");
+        if (tout && b === null)
+            return setErr("Enter the time out, or leave it empty.");
+        if (b !== null && b < a)
+            return setErr("Time out is before time in.");
+        if (date > today)
+            return setErr("The date can't be in the future.");
+        if (entry)
+            actions.attendEdit(entry.id, { date, in: tin, out: tout || "" });
+        else
+            actions.attendAdd(person, date, tin, tout || "");
+        close();
+    };
+    const mins = hmMin(tin) !== null && hmMin(tout) !== null ? Math.max(0, hmMin(tout) - hmMin(tin)) : null;
+    return (React.createElement("div", null,
+        React.createElement("div", { className: "notice", style: { marginTop: 0 } },
+            React.createElement("b", null, who.name),
+            React.createElement("br", null),
+            who.pid,
+            " / ",
+            who.group || who.type,
+            " / ",
+            personKind(who.type)),
+        React.createElement("label", { className: "field" },
+            React.createElement("span", null, "Date"),
+            React.createElement("input", { className: "input", type: "date", value: date, max: today, onChange: (e) => e.target.value && setDate(e.target.value) })),
+        React.createElement("div", { className: "grid2" },
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Time in"),
+                React.createElement("input", { className: "input", type: "time", value: tin, onChange: (e) => { setTin(e.target.value); setErr(""); } })),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Time out"),
+                React.createElement("input", { className: "input", type: "time", value: tout, onChange: (e) => { setTout(e.target.value); setErr(""); } }))),
+        React.createElement("p", { style: { fontSize: 14, color: "var(--muted)", margin: "8px 0 0" } }, mins !== null ? `Hours of study: ${fmtHM(mins)}` : "Leave time out empty if they are still in the library."),
+        err && React.createElement("div", { className: "err" }, err),
+        React.createElement("div", { className: "btn-row" },
+            entry && (React.createElement("button", { className: "btn btn-danger", onClick: () => {
+                    if (!confirmDel)
+                        return setConfirmDel(true);
+                    actions.attendDelete(entry.id);
+                    close();
+                } }, confirmDel ? "Tap again to delete" : "Delete")),
+            React.createElement("button", { className: "btn btn-ghost", onClick: close }, "Cancel"),
+            React.createElement("button", { className: "btn btn-primary", onClick: save }, "Save"))));
+}
+function MemberAttendance({ ctx, memberId }) {
+    const { state, today } = ctx;
+    const nowMin = hmMin(nowHM());
+    const mine = attendList(state).filter((e) => e.pid === memberId);
+    if (!mine.length)
+        return null;
+    const month = attendanceSummary(mine, firstOfMonth(today), today, "all", today, nowMin)[0];
+    const ever = attendanceSummary(mine, "0000-00-00", today, "all", today, nowMin)[0];
+    const last = [...mine].sort((a, b) => (a.date + a.in < b.date + b.in ? 1 : -1))[0];
+    return (React.createElement(React.Fragment, null,
+        React.createElement("h2", { className: "sec" }, "Library attendance"),
+        React.createElement("div", { className: "ledger att-ledger" },
+            React.createElement("div", { style: { "--lt": "#E0EFF8" } },
+                React.createElement("b", { style: { color: "#155F8C" } }, month ? month.days : 0),
+                React.createElement("span", null, "Days this month")),
+            React.createElement("div", { style: { "--lt": "var(--okBg)" } },
+                React.createElement("b", { style: { color: "var(--ink)" } }, fmtHM(month ? month.mins : 0)),
+                React.createElement("span", null, "Hours this month")),
+            React.createElement("div", { style: { "--lt": "var(--brassBg)" } },
+                React.createElement("b", { style: { color: "var(--brass)" } }, fmtHM(ever ? ever.mins : 0)),
+                React.createElement("span", null, "Hours in all"))),
+        React.createElement("p", { className: "count" },
+            "Last visit ",
+            fmtDate(last.date),
+            ", ",
+            fmtTime(last.in),
+            last.out ? ` to ${fmtTime(last.out)}` : "",
+            ".")));
+}
+
 /* ---------- app ---------- */
 "use strict";
 /* ---------- admin login ---------- */
@@ -21795,6 +22312,30 @@ function App() {
             loans: p.loans.map((l) => (l.memberId === id && l.returned && l.fine > 0 ? stamp({ ...l, finePaid: true }) : l)),
         })),
         saveSettings: (f) => setState((p) => ({ ...p, settings: { ...f }, settingsU: now() })),
+        attendIn: (m, date, tin) => setState((p) => {
+            const list = p.attendance || [];
+            if (list.some((e) => e.pid === m.id && e.date === date && !e.out))
+                return p;
+            return { ...p, attendance: [...list, stamp({ id: "A" + newId().slice(1), pid: m.id, name: m.name, type: m.type, group: m.group || "", date, in: tin, out: "" })] };
+        }),
+        attendAdd: (m, date, tin, tout) => setState((p) => ({
+            ...p,
+            attendance: [...(p.attendance || []), stamp({ id: "A" + newId().slice(1), pid: m.id, name: m.name, type: m.type, group: m.group || "", date, in: tin, out: tout })],
+        })),
+        attendOut: (id, tout) => setState((p) => ({
+            ...p,
+            attendance: (p.attendance || []).map((e) => (e.id === id ? stamp({ ...e, out: (hmMin(tout) || 0) < (hmMin(e.in) || 0) ? e.in : tout }) : e)),
+        })),
+        attendAllOut: (date, tout) => setState((p) => ({
+            ...p,
+            attendance: (p.attendance || []).map((e) => (e.date === date && !e.out ? stamp({ ...e, out: (hmMin(tout) || 0) < (hmMin(e.in) || 0) ? e.in : tout }) : e)),
+        })),
+        attendEdit: (id, data) => setState((p) => ({ ...p, attendance: (p.attendance || []).map((e) => (e.id === id ? stamp({ ...e, ...data }) : e)) })),
+        attendDelete: (id) => setState((p) => ({
+            ...p,
+            attendance: (p.attendance || []).filter((e) => e.id !== id),
+            deleted: { ...p.deleted, attendance: [...((p.deleted || {}).attendance || []), { id, u: now() }] },
+        })),
         resetAll: () => setState((p) => ({
             ...DEFAULT_STATE,
             admin: p.admin,
@@ -21805,6 +22346,7 @@ function App() {
             deleted: {
                 members: [...((p.deleted || {}).members || []), ...p.members.map((m) => ({ id: m.id, u: now() }))],
                 loans: [...((p.deleted || {}).loans || []), ...p.loans.map((l) => ({ id: l.id, u: now() }))],
+                attendance: [...((p.deleted || {}).attendance || []), ...(p.attendance || []).map((e) => ({ id: e.id, u: now() }))],
             },
         })),
         restore: (next, catalogue) => {
@@ -21826,6 +22368,7 @@ function App() {
                 adminU: next.admin ? now() : p.adminU,
                 members: (next.members || []).map((m) => stamp(m)),
                 loans: (next.loans || []).map((l) => stamp(l)),
+                attendance: (next.attendance || []).map((e) => stamp(e)),
                 settingsU: now(),
                 notifiedU: now(),
             }));
@@ -21938,6 +22481,7 @@ function App() {
         ["books", "Books", Library],
         ["members", "Borrowers", Users],
         ["loans", "Loans", ClipboardList],
+        ["attendance", "Attendance", CalendarCheck],
     ];
     const titles = {
         issue: "Issue a book",
@@ -21950,6 +22494,7 @@ function App() {
         stock: "Stock check",
         bookForm: "Book",
         message: "Message borrower",
+        attend: "Attendance entry",
     };
     if (!adminRec && fileState === "checking") {
         // don't flash "Create the admin login" while the website's login file is still loading
@@ -21992,7 +22537,8 @@ function App() {
             tab === "checkout" && React.createElement(CheckoutView, { ctx: ctx }),
             tab === "books" && React.createElement(BooksView, { ctx: ctx }),
             tab === "members" && React.createElement(MembersView, { ctx: ctx }),
-            tab === "loans" && React.createElement(LoansView, { ctx: ctx, seg: loanSeg, setSeg: setLoanSeg })),
+            tab === "loans" && React.createElement(LoansView, { ctx: ctx, seg: loanSeg, setSeg: setLoanSeg }),
+            tab === "attendance" && React.createElement(AttendanceView, { ctx: ctx })),
         React.createElement("nav", { className: "cm-nav", "aria-label": "Sections" },
             React.createElement("div", { className: "rail-brand", "aria-hidden": "true" },
                 React.createElement("div", { className: "spine", style: { minWidth: 0 } },
@@ -22015,6 +22561,7 @@ function App() {
                 } })),
             sheet.type === "bookForm" && React.createElement(BookForm, { key: sheet.key, ctx: ctx, sl: sheet.sl }),
             sheet.type === "stock" && React.createElement(StockFlow, { key: sheet.key, ctx: ctx }),
+            sheet.type === "attend" && React.createElement(AttendanceForm, { key: sheet.key, ctx: ctx, entryId: sheet.entryId, pid: sheet.pid, date: sheet.date }),
             sheet.type === "reminders" && React.createElement(RemindersFlow, { key: sheet.key, ctx: ctx, kind: sheet.kind }),
             sheet.type === "message" && (React.createElement(MessageFlow, { key: sheet.key, ctx: ctx, memberId: sheet.memberId, kind: sheet.kind, loanIds: sheet.loanIds })),
             sheet.type === "settings" && React.createElement(SettingsForm, { key: sheet.key, ctx: ctx }))),
